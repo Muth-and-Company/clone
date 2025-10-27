@@ -29,6 +29,17 @@ The script supports the following modes:
  - Dry-run / verbose calculation: use `--dry-run` with `--calc-only` to print internal calculation details (source needed bytes, destination capacity, recommended GB) without performing any changes.
  - Recreate-and-clone: use `--recreate` to tell the script to recreate the destination partition table in a safe order (p1, p2 sized to the recommendation, then p3...), clone data into the new partitions, and resize the filesystem. This is the safest automated way to fill a larger destination when simple resizing would overlap other partitions.
 
+New flags (safety and control):
+
+- `--reserve-gb N` — when using `--fill`, reserve N GiB at the end of the destination disk instead of filling it completely (default: 1 GiB). Useful to leave a small safety buffer.
+- `--main-part N` — force the script to treat source partition number N (for example `2`) as the main partition to be resized/cloned. By default the script picks the largest NTFS partition.
+- `--yes` — skip interactive confirmation prompts and auto-confirm destructive steps. Use with caution; recommended only when scripting or after confirming a `--dry-run` first.
+
+Recreate behavior and safety notes:
+
+- When `--recreate` runs it will print the exact `parted` mkpart commands the script will execute (in `--dry-run` they are shown but not executed). When run without `--dry-run` you will be prompted to confirm the mkpart execution. Use `--yes` to skip the prompts.
+- The script creates backups before destructive actions: a `sfdisk` dump named `<disk>.partitions.sfdisk` and an initial disk image `<disk>.mbr.bin` (first 2048 sectors). Verify those files exist before proceeding.
+
 ### Examples
 
 ```bash
@@ -86,6 +97,19 @@ Reboot the system and verify that Windows boots correctly from the cloned drive.
 - The script assumes the source drive has a single NTFS partition. If your drive has multiple partitions, additional steps may be required.
 - If the cloned drive does not boot, ensure the partition flags are set correctly using `parted` or `diskpart`.
 - This script does not handle non-NTFS filesystems.
+
+Recent changes (what I added in this branch):
+
+- Destination-aware calculation with `--fill` and `--dry-run` reporting.
+- `--recreate` mode that safely recreates the destination partition table, clones partitions, and resizes the main NTFS partition.
+- New safety and control flags: `--reserve-gb`, `--main-part`, and `--yes`.
+- The recreate flow prints exact `parted mkpart` commands and requires confirmation before executing them.
+
+Planned/next improvements:
+
+- Add an explicit `--gpt`/`--use-gpt` option to switch to GPT partition labels automatically for large drives.
+- Add a small test-mode that simulates `dd`/`ntfsclone` without writing data (useful for CI/dry-run automation).
+- More robust error handling and retry logic for parted/ntfsclone/disk IO failures.
 
 Notes about the calculation:
 

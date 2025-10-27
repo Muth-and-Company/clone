@@ -51,6 +51,7 @@ FILL=false
 RECREATE=false
 RESERVE_GB=1
 MAIN_PART_OVERRIDE=""
+YES=false
 SOURCE_DRIVE=""
 DEST_DRIVE=""
 PARTITION_SIZE=""
@@ -69,6 +70,8 @@ while [[ $# -gt 0 ]]; do
       RESERVE_GB="$2"; shift 2;;
     --main-part)
       MAIN_PART_OVERRIDE="$2"; shift 2;;
+    --yes)
+      YES=true; shift;;
     --dry-run)
       DRY_RUN=true; shift;;
     -h|--help)
@@ -616,7 +619,12 @@ recreate_and_clone() {
     return 0
   fi
 
-  read -p "About to recreate partition table and clone data on $DEST_DRIVE. This is destructive. Continue? (y/n): " ok
+  if [[ "$YES" == true ]]; then
+    echo "Auto-confirm enabled (--yes): proceeding with destructive operation." >&2
+    ok="y"
+  else
+    read -p "About to recreate partition table and clone data on $DEST_DRIVE. This is destructive. Continue? (y/n): " ok
+  fi
   if [[ "$ok" != "y" ]]; then echo "Aborting."; return 1; fi
 
   # Backup partition table and MBR/GPT
@@ -643,7 +651,12 @@ recreate_and_clone() {
   for ((i=0;i<parts;i++)); do
     echo "  ${mkcmds[$i]}" >&2
   done
-  read -p "Execute these parted mkpart commands? This will destroy data on $DEST_DRIVE. (y/n): " do_mk
+  if [[ "$YES" == true ]]; then
+    echo "Auto-confirm enabled (--yes): executing mkpart commands." >&2
+    do_mk="y"
+  else
+    read -p "Execute these parted mkpart commands? This will destroy data on $DEST_DRIVE. (y/n): " do_mk
+  fi
   if [[ "$do_mk" != "y" ]]; then
     echo "Aborting before creating partitions." >&2
     return 1
@@ -757,7 +770,12 @@ echo "Source Partition: $SOURCE_PARTITION"
 echo "Destination Drive: $DEST_DRIVE"
 echo "Destination Partition: $DEST_PARTITION"
 echo "Main Partition Size: ${PARTITION_SIZE}GB"
-read -p "Are these details correct? (y/n): " CONFIRM
+if [[ "$YES" == true ]]; then
+  echo "Auto-confirm enabled (--yes): proceeding with these details." >&2
+  CONFIRM="y"
+else
+  read -p "Are these details correct? (y/n): " CONFIRM
+fi
 if [[ $CONFIRM != "y" ]]; then
   echo "Aborting."
   exit 1
