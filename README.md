@@ -27,6 +27,7 @@ The script supports the following modes:
 - Calculate-only: use `--calc-only` to calculate the optimal size and print it, without making changes.
  - Fill destination: use `--fill` with `--calc-only` or `--auto` to make the script choose a partition size that fills the destination disk (preserving the source partition start); useful when you want the cloned partition to occupy most of the destination drive.
  - Dry-run / verbose calculation: use `--dry-run` with `--calc-only` to print internal calculation details (source needed bytes, destination capacity, recommended GB) without performing any changes.
+ - Recreate-and-clone: use `--recreate` to tell the script to recreate the destination partition table in a safe order (p1, p2 sized to the recommendation, then p3...), clone data into the new partitions, and resize the filesystem. This is the safest automated way to fill a larger destination when simple resizing would overlap other partitions.
 
 ### Examples
 

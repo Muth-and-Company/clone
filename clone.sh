@@ -19,6 +19,7 @@ Positional arguments:
 Options:
   --calc-only                  Calculate the optimal main partition size (GB) and print it, then exit
   --auto                       Calculate optimal size and use it for the resize (overrides provided size)
+  --recreate                   Recreate destination partition layout and clone partitions (safe automated)
   --fill                       Fill the destination disk (use available space) when calculating recommended size
   --dry-run                    Show detailed calculation and recommended values without changing disks
   -h, --help                   Show this help message
@@ -47,6 +48,7 @@ CALC_ONLY=false
 AUTO=false
 DRY_RUN=false
 FILL=false
+RECREATE=false
 SOURCE_DRIVE=""
 DEST_DRIVE=""
 PARTITION_SIZE=""
@@ -59,6 +61,8 @@ while [[ $# -gt 0 ]]; do
       AUTO=true; shift;;
     --fill)
       FILL=true; shift;;
+    --recreate)
+      RECREATE=true; shift;;
     --dry-run)
       DRY_RUN=true; shift;;
     -h|--help)
@@ -384,6 +388,139 @@ compute_recommended_gb() {
   echo "$recommended"
 }
 
+# Recreate destination partition layout and clone partitions safely.
+# This automated mode supports a common 3-partition layout: p1 small, p2 main NTFS, p3 small.
+recreate_and_clone() {
+  echo "Running recreate-and-clone mode (safe automated)." >&2
+  # Ensure we have needed values
+  out=$(calculate_optimal_gb) || { echo "Failed to calculate optimal size." >&2; return 1; }
+  needed_bytes=$(echo "$out" | awk -F: '{print $1}')
+  needed_gb=$(echo "$out" | awk -F: '{print $2}')
+  CALC_BYTES=$needed_bytes
+
+  # Detect source drive base (strip partition number)
+  if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
+    src_drive_base=$(echo "$SOURCE_DRIVE" | sed -E 's/(p?[0-9]+)$//')
+  else
+    src_drive_base=$SOURCE_DRIVE
+  fi
+
+  # Read source partition table (ms machine-readable)
+  src_map=$(parted -ms "$src_drive_base" unit s print 2>/dev/null)
+  if [[ -z "$src_map" ]]; then
+    echo "Failed to read source partition table." >&2
+    return 1
+  fi
+
+  # Count partitions
+  part_count=$(echo "$src_map" | wc -l)
+  # parted -ms prints header + one line per partition, so parts = lines-1
+  parts=$((part_count - 1))
+  if [[ $parts -ne 3 ]]; then
+    echo "Recreate mode currently supports a 3-partition source layout (p1/p2/p3). Detected $parts partitions." >&2
+    return 1
+  fi
+
+  # Parse partition lines
+  # header is line1; p1 line is NR==2, p2 NR==3, p3 NR==4
+  p1_line=$(echo "$src_map" | sed -n '2p')
+  p2_line=$(echo "$src_map" | sed -n '3p')
+  p3_line=$(echo "$src_map" | sed -n '4p')
+
+  p1_start=$(echo "$p1_line" | awk -F: '{print $2}' | sed 's/s$//')
+  p1_end=$(echo "$p1_line" | awk -F: '{print $3}' | sed 's/s$//')
+  p1_type=$(echo "$p1_line" | awk -F: '{print $6}')
+
+  p2_start=$(echo "$p2_line" | awk -F: '{print $2}' | sed 's/s$//')
+  p2_end_src=$(echo "$p2_line" | awk -F: '{print $3}' | sed 's/s$//')
+  p2_type=$(echo "$p2_line" | awk -F: '{print $6}')
+
+  p3_start=$(echo "$p3_line" | awk -F: '{print $2}' | sed 's/s$//')
+  p3_end=$(echo "$p3_line" | awk -F: '{print $3}' | sed 's/s$//')
+  p3_type=$(echo "$p3_line" | awk -F: '{print $6}')
+
+  # Destination sizes
+  dest_header=$(parted -ms "$DEST_DRIVE" unit s print 2>/dev/null | head -n1)
+  dest_total_sectors=$(echo "$dest_header" | awk -F: '{print $2}' | sed 's/s$//')
+  sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
+
+  # Compute needed sectors for p2
+  needed_sectors=$(awk "BEGIN{printf \"%d\", int( ($CALC_BYTES + ($CALC_BYTES*0.05) + 1073741824 -1) / $sector_size )}")
+
+  # compute p3 size in sectors
+  p3_size=$((p3_end - p3_start + 1))
+
+  # compute new p2_end so that p3 can sit after it
+  new_p2_end=$(( dest_total_sectors - p3_size - 2048 ))
+  # prefer computed from needed_sectors starting at p2_start
+  candidate_end=$(( p2_start + needed_sectors - 1 ))
+  if [[ $candidate_end -le $new_p2_end ]]; then
+    final_p2_end=$candidate_end
+  else
+    # shrink to fit available
+    final_p2_end=$new_p2_end
+  fi
+
+  # compute where p3 will start and end
+  new_p3_start=$(( final_p2_end + 1 ))
+  new_p3_end=$(( new_p3_start + p3_size - 1 ))
+
+  echo "Planned layout (sectors):" >&2
+  echo "p1: $p1_start - $p1_end" >&2
+  echo "p2: $p2_start - $final_p2_end" >&2
+  echo "p3: $new_p3_start - $new_p3_end" >&2
+
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "DRY-RUN: would back up partition table and create new partitions as above." >&2
+    echo "DRY-RUN: would clone p1 (dd), clone p2 (ntfsclone), clone p3 (dd) and run ntfsresize on p2." >&2
+    return 0
+  fi
+
+  read -p "About to recreate partition table and clone data on $DEST_DRIVE. This is destructive. Continue? (y/n): " ok
+  if [[ "$ok" != "y" ]]; then echo "Aborting."; return 1; fi
+
+  # Backup partition table and MBR/GPT
+  echo "Backing up destination partition table..." >&2
+  sudo sfdisk -d "$DEST_DRIVE" > "${DEST_DRIVE##*/}.partitions.sfdisk" 2>/dev/null || true
+  sudo dd if="$DEST_DRIVE" of="${DEST_DRIVE##*/}.mbr.bin" bs=512 count=2048 2>/dev/null || true
+
+  # Create new partition table
+  echo "Creating new partition table on $DEST_DRIVE..." >&2
+  parted -s "$DEST_DRIVE" mklabel msdos
+
+  # create p1
+  parted -s "$DEST_DRIVE" unit s mkpart primary ${p1_start}s ${p1_end}s
+  # create p2
+  parted -s "$DEST_DRIVE" unit s mkpart primary ${p2_start}s ${final_p2_end}s
+  # create p3
+  parted -s "$DEST_DRIVE" unit s mkpart primary ${new_p3_start}s ${new_p3_end}s
+
+  # copy p1 content
+  dest_p1=$(build_part "$DEST_DRIVE" 1)
+  src_p1=$(build_part "$src_drive_base" 1)
+  echo "Copying p1 from $src_p1 to $dest_p1..." >&2
+  dd if="$src_p1" of="$dest_p1" bs=4M conv=sync,notrunc status=progress
+
+  # clone p2
+  dest_p2=$(build_part "$DEST_DRIVE" 2)
+  src_p2=$(build_part "$src_drive_base" 2)
+  echo "Cloning NTFS partition from $src_p2 to $dest_p2..." >&2
+  ntfsclone --overwrite "$dest_p2" "$src_p2"
+
+  # copy p3 content
+  dest_p3=$(build_part "$DEST_DRIVE" 3)
+  src_p3=$(build_part "$src_drive_base" 3)
+  echo "Copying p3 from $src_p3 to $dest_p3..." >&2
+  dd if="$src_p3" of="$dest_p3" bs=4M conv=sync,notrunc status=progress || true
+
+  # Resize filesystem
+  echo "Resizing NTFS filesystem on $dest_p2..." >&2
+  ntfsresize "$dest_p2"
+
+  echo "Recreate-and-clone complete." >&2
+  return 0
+}
+
 # If requested, calculate and print size, or calculate and use it
 if [[ "$CALC_ONLY" == true ]]; then
   if recommended=$(compute_recommended_gb 2>/dev/null); then
@@ -399,6 +536,14 @@ if [[ "$AUTO" == true ]]; then
   recommended=$(compute_recommended_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
   PARTITION_SIZE=$recommended
   echo "Using calculated partition size: ${PARTITION_SIZE}GB"
+fi
+
+if [[ "$RECREATE" == true ]]; then
+  recommended=$(compute_recommended_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
+  PARTITION_SIZE=$recommended
+  echo "Running recreate-and-clone with target ${PARTITION_SIZE}GB (dry-run=$DRY_RUN)"
+  recreate_and_clone || { echo "Recreate-and-clone failed." >&2; exit 1; }
+  exit 0
 fi
 
 if [[ -z "$PARTITION_SIZE" ]]; then
