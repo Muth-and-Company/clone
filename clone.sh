@@ -81,6 +81,17 @@ get_part() {
   fi
 }
 
+# Build a partition path for a drive and partition number
+build_part() {
+  local drive="$1"
+  local num="$2"
+  if [[ "$drive" =~ nvme ]] || [[ "$drive" =~ mmcblk ]]; then
+    echo "${drive}p${num}"
+  else
+    echo "${drive}${num}"
+  fi
+}
+
 # Calculate optimal size (GB) for main NTFS partition on source drive
 calculate_optimal_gb() {
   local src_part
@@ -117,7 +128,8 @@ calculate_optimal_gb() {
   local line parsed num unit ss largest
   line=$(echo "$info" | grep -iE 'bytes' | head -n1 || true)
   if [[ -n "$line" ]]; then
-    parsed=$(echo "$line" | sed -nE 's/.*?([0-9]+) ?bytes.*/\1/p' || true)
+    # use greedy .* to capture the large byte value (avoid non-greedy '?')
+    parsed=$(echo "$line" | sed -nE 's/.*([0-9]+) ?bytes.*/\1/p' || true)
     if [[ -n "$parsed" ]]; then
       bytes=$parsed
     fi
@@ -243,8 +255,34 @@ dd if=$SOURCE_DRIVE of=$DEST_DRIVE bs=512 count=1 conv=notrunc
 
 # Use ntfsclone to clone the NTFS partition
 echo "Cloning NTFS partition..."
-SOURCE_PARTITION=$(get_part "$SOURCE_DRIVE")
-DEST_PARTITION=$(get_part "$DEST_DRIVE")
+# Determine partition number and construct matching partition paths
+PART_NUM=""
+if [[ "$SOURCE_DRIVE" =~ ([0-9]+)$ ]]; then
+  PART_NUM="${BASH_REMATCH[1]}"
+fi
+
+if [[ -n "$PART_NUM" && -b "$SOURCE_DRIVE" ]]; then
+  # user passed a partition path (e.g. /dev/nvme0n1p2 or /dev/sda2)
+  SOURCE_PARTITION="$SOURCE_DRIVE"
+else
+  # default to partition 1 or try to detect NTFS partition
+  if command -v lsblk >/dev/null 2>&1; then
+    detected=$(lsblk -nr -o NAME,FSTYPE "$SOURCE_DRIVE" 2>/dev/null | awk '$2 ~ /ntfs/ {print "/dev/" $1; exit}')
+    if [[ -n "$detected" ]]; then
+      SOURCE_PARTITION=$detected
+      if [[ "$detected" =~ ([0-9]+)$ ]]; then PART_NUM="${BASH_REMATCH[1]}"; fi
+    else
+      PART_NUM=1
+      SOURCE_PARTITION=$(build_part "$SOURCE_DRIVE" "$PART_NUM")
+    fi
+  else
+    PART_NUM=1
+    SOURCE_PARTITION=$(build_part "$SOURCE_DRIVE" "$PART_NUM")
+  fi
+fi
+
+# Build destination partition path using same partition number
+DEST_PARTITION=$(build_part "$DEST_DRIVE" "$PART_NUM")
 
 # Confirm the drives
 echo "Source Drive: $SOURCE_DRIVE"
@@ -279,8 +317,9 @@ if [[ -n "$CALC_BYTES" && "$CALC_BYTES" -gt 0 ]]; then
   # sector size (bytes)
   sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
 
-  # start sector of partition 1 on destination drive
-  start_sector=$(parted -ms "$DEST_DRIVE" unit s print | awk -F: 'NR==2{print $2}')
+  # start sector of the partition on destination drive (use PART_NUM)
+  part_line=$((PART_NUM + 1))
+  start_sector=$(parted -ms "$DEST_DRIVE" unit s print | awk -F: -v ln="$part_line" 'NR==ln{print $2}')
   if [[ -z "$start_sector" ]]; then
     echo "Failed to determine start sector for ${DEST_DRIVE} - falling back to GB-based resize" >&2
     parted "$DEST_DRIVE" resizepart 1 ${PARTITION_SIZE}GB
