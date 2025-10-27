@@ -453,21 +453,20 @@ recreate_and_clone() {
 
   parts=$idx
 
-  # Identify main partition: prefer NTFS, otherwise largest partition
+  # Identify main partition: prefer the largest NTFS partition. If no NTFS, pick overall largest.
   main_idx=-1
-  for i in "$(seq 0 $((parts-1)))"; do
-    # expand seq output correctly in bash
-    :
-  done
+  max_ntfs_size=0
   for ((i=0;i<parts;i++)); do
     fs=${p_fs[$i]}
     if [[ -n "$fs" && "$fs" =~ ntfs ]]; then
-      main_idx=$i
-      break
+      if [[ ${p_size[$i]} -gt $max_ntfs_size ]]; then
+        max_ntfs_size=${p_size[$i]}
+        main_idx=$i
+      fi
     fi
   done
   if [[ $main_idx -eq -1 ]]; then
-    # pick largest partition by sectors
+    # pick largest partition by sectors (no NTFS found)
     maxsize=0
     for ((i=0;i<parts;i++)); do
       if [[ ${p_size[$i]} -gt $maxsize ]]; then
