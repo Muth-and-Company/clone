@@ -111,7 +111,7 @@ calculate_optimal_gb() {
           ss=$(blockdev --getss "$src_part" 2>/dev/null || blockdev --getss "${SOURCE_DRIVE}" 2>/dev/null || echo 512)
           bytes=$(awk "BEGIN{printf \"%d\", $num * $ss}")
           ;;
-        byte*|bytes|b|)
+        byte*|bytes|b)
           bytes=$num
           ;;
         kb|k|kbyte|kbytes)
