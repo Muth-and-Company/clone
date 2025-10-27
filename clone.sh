@@ -661,13 +661,32 @@ recreate_and_clone() {
 
   # Build and show exact parted mkpart commands for safety
   declare -a mkcmds
+
+  # Get total sector count of destination to ensure GPT-safe partition ends
+  dest_total_sectors=$(blockdev --getsz "$DEST_DRIVE")
+  safe_end=$((dest_total_sectors - 34))  # leave space for GPT backup header
+
   for ((i=0;i<parts;i++)); do
     s=${new_start[$i]}
     e=${new_end[$i]}
+
+    # Ensure the end sector doesn’t collide with GPT backup
+    if (( e > safe_end )); then
+      echo "WARNING: Partition $((i+1)) end sector $e exceeds GPT-safe boundary ($safe_end). Adjusting." >&2
+      e=$safe_end
+    fi
+
+    # Sanity check: start must be less than end
+    if (( s >= e )); then
+      echo "ERROR: Invalid partition range for partition $((i+1)) (start=$s end=$e). Skipping this partition." >&2
+      continue
+    fi
+
     cmd=(parted -s "$DEST_DRIVE" unit s mkpart primary ${s}s ${e}s)
     mkcmds[$i]="${cmd[*]}"
     echo "MKPART: ${mkcmds[$i]}" >&2
   done
+
 
   # Show commands and confirm before executing
   echo "The following parted commands will be executed to create partitions:" >&2
