@@ -557,7 +557,15 @@ recreate_and_clone() {
         prev=$(( i-1 ))
         s=$(( new_end[$prev] + 1 ))
       fi
+      # Align start sector to 2048-sector boundary
+      if [[ $((s % 2048)) -ne 0 ]]; then
+        s=$(( (s + 2047) / 2048 * 2048 ))
+      fi
       e=$(( s + p_size[$i] - 1 ))
+      # Ensure end sector does not exceed total sectors
+      if [[ $e -gt $dest_total_sectors ]]; then
+        e=$dest_total_sectors
+      fi
       new_start[$i]=$s
       new_end[$i]=$e
     fi
@@ -600,11 +608,10 @@ recreate_and_clone() {
     src_part=$(build_part "$src_drive_base" ${p_num[$i]})
     dest_part=$(build_part "$DEST_DRIVE" ${p_num[$i]})
     fs=${p_fs[$i]}
-    echo "Processing partition ${p_num[$i]} (fs=${fs}): $src_part -> $dest_part" >&2
-    if [[ -n "$fs" && "$fs" =~ ntfs ]]; then
+    echo "Processing partition ${p_num[$i]}: $src_part -> $dest_part" >&2
+    if [[ -n "${p_fs[$i]}" && "${p_fs[$i]}" =~ ntfs ]]; then
       echo "Cloning NTFS partition $src_part -> $dest_part" >&2
       ntfsclone --overwrite "$dest_part" "$src_part"
-      main_dest_part=$dest_part
     else
       echo "Copying partition $src_part -> $dest_part (dd)" >&2
       dd if="$src_part" of="$dest_part" bs=4M conv=sync,notrunc status=progress || true
