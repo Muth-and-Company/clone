@@ -49,6 +49,8 @@ AUTO=false
 DRY_RUN=false
 FILL=false
 RECREATE=false
+RESERVE_GB=1
+MAIN_PART_OVERRIDE=""
 SOURCE_DRIVE=""
 DEST_DRIVE=""
 PARTITION_SIZE=""
@@ -63,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       FILL=true; shift;;
     --recreate)
       RECREATE=true; shift;;
+    --reserve-gb)
+      RESERVE_GB="$2"; shift 2;;
+    --main-part)
+      MAIN_PART_OVERRIDE="$2"; shift 2;;
     --dry-run)
       DRY_RUN=true; shift;;
     -h|--help)
@@ -335,8 +341,9 @@ compute_recommended_gb() {
       fi
     fi
 
-    reserve_gb=1
-    reserve_bytes=$(awk "BEGIN{printf \"%d\", $reserve_gb * 1024 * 1024 * 1024}")
+  # allow global override of reserve via --reserve-gb
+  reserve_gb=${RESERVE_GB:-1}
+  reserve_bytes=$(awk "BEGIN{printf \"%d\", $reserve_gb * 1024 * 1024 * 1024}")
 
     # default fallback: fill from sector 0 (full disk) minus reserve
     if [[ -z "$src_part_num" || -z "$src_drive_base" ]]; then
@@ -369,6 +376,7 @@ compute_recommended_gb() {
       echo "Fill mode: start_sector=$start_sector, start_bytes=${start_bytes:-0}, dest_bytes=$dest_bytes, reserve_bytes=$reserve_bytes" >&2
       echo "Recommended target (GB): $recommended" >&2
       echo "Source needed (bytes): $needed_bytes" >&2
+      echo "Reserve (GB): $reserve_gb" >&2
     fi
     echo "${recommended_bytes}:${recommended}"
     return 0
@@ -474,6 +482,23 @@ recreate_and_clone() {
         main_idx=$i
       fi
     done
+  fi
+
+  # If user forced a main partition number, honor it (match against p_num values)
+  if [[ -n "$MAIN_PART_OVERRIDE" ]]; then
+    forced_index=-1
+    for ((i=0;i<parts;i++)); do
+      if [[ "${p_num[$i]}" == "$MAIN_PART_OVERRIDE" ]]; then
+        forced_index=$i
+        break
+      fi
+    done
+    if [[ $forced_index -ne -1 ]]; then
+      echo "INFO: Forcing main partition to source partition number ${MAIN_PART_OVERRIDE} (index $forced_index)" >&2
+      main_idx=$forced_index
+    else
+      echo "WARN: --main-part ${MAIN_PART_OVERRIDE} not found on source; ignoring." >&2
+    fi
   fi
 
   if [[ $main_idx -eq -1 ]]; then
@@ -603,12 +628,31 @@ recreate_and_clone() {
   echo "Creating new partition table on $DEST_DRIVE..." >&2
   parted -s "$DEST_DRIVE" mklabel msdos
 
-  # Create partitions according to new_start/new_end
+  # Build and show exact parted mkpart commands for safety
+  declare -a mkcmds
   for ((i=0;i<parts;i++)); do
     s=${new_start[$i]}
     e=${new_end[$i]}
-    echo "Creating partition p${p_num[$i]}: ${s}s - ${e}s" >&2
-    parted -s "$DEST_DRIVE" unit s mkpart primary ${s}s ${e}s
+    cmd=(parted -s "$DEST_DRIVE" unit s mkpart primary ${s}s ${e}s)
+    mkcmds[$i]="${cmd[*]}"
+    echo "MKPART: ${mkcmds[$i]}" >&2
+  done
+
+  # Show commands and confirm before executing
+  echo "The following parted commands will be executed to create partitions:" >&2
+  for ((i=0;i<parts;i++)); do
+    echo "  ${mkcmds[$i]}" >&2
+  done
+  read -p "Execute these parted mkpart commands? This will destroy data on $DEST_DRIVE. (y/n): " do_mk
+  if [[ "$do_mk" != "y" ]]; then
+    echo "Aborting before creating partitions." >&2
+    return 1
+  fi
+
+  # Execute mkpart commands
+  for ((i=0;i<parts;i++)); do
+    echo "Executing: ${mkcmds[$i]}" >&2
+    ${mkcmds[$i]}
   done
 
   # Copy/clone partitions
