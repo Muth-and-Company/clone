@@ -146,6 +146,8 @@ calculate_optimal_gb() {
   fi
 
   if [[ -n "$bytes" && "$bytes" -gt 0 ]]; then
+    # expose bytes globally so caller can compute sector-aligned partition end
+    CALC_BYTES=$bytes
     # Convert bytes -> GB (float), add margin (5% or 1 GB min), ceil to integer
     local min_gb margin_gb optimal_gb
     min_gb=$(awk "BEGIN{printf \"%f\", $bytes/1024/1024/1024}")
@@ -238,10 +240,38 @@ dd if=$SOURCE_DRIVE of=$DEST_DRIVE bs=512 count=1 conv=notrunc
 echo "Cloning NTFS partition..."
 ntfsclone --overwrite "$DEST_PARTITION" "$SOURCE_PARTITION"
 
+
 # Resize the destination partition
 echo "Resizing the destination partition to ${PARTITION_SIZE}GB..."
-# parted uses partition number (1), not partition path
-parted "$DEST_DRIVE" resizepart 1 ${PARTITION_SIZE}GB
+# If we have a precise byte count from ntfsresize parsing, compute an end sector
+if [[ -n "$CALC_BYTES" && "$CALC_BYTES" -gt 0 ]]; then
+  echo "Using precise byte count from ntfsresize: $CALC_BYTES bytes" >&2
+  # Add margin: 5% or minimum 1 GiB
+  margin_bytes=$(awk "BEGIN{m=$CALC_BYTES*0.05; if(m<1073741824) m=1073741824; printf \"%d\", m}")
+  total_bytes=$(awk "BEGIN{printf \"%d\", $CALC_BYTES + $margin_bytes}")
+
+  # sector size (bytes)
+  sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
+
+  # start sector of partition 1 on destination drive
+  start_sector=$(parted -ms "$DEST_DRIVE" unit s print | awk -F: 'NR==2{print $2}')
+  if [[ -z "$start_sector" ]]; then
+    echo "Failed to determine start sector for ${DEST_DRIVE} - falling back to GB-based resize" >&2
+    parted "$DEST_DRIVE" resizepart 1 ${PARTITION_SIZE}GB
+  else
+    # compute needed sectors and end sector
+    needed_sectors=$(awk "BEGIN{printf \"%d\", int( ($total_bytes + $sector_size - 1) / $sector_size )}")
+    end_sector=$(awk "BEGIN{printf \"%d\", $start_sector + $needed_sectors - 1}")
+    echo "Resizing partition 1 to end at sector $end_sector (unit: sectors)" >&2
+    parted -s "$DEST_DRIVE" unit s resizepart 1 $end_sector || {
+      echo "Sector-based resize failed; trying GB-based resize as fallback." >&2
+      parted "$DEST_DRIVE" resizepart 1 ${PARTITION_SIZE}GB
+    }
+  fi
+else
+  # parted uses partition number (1), not partition path
+  parted "$DEST_DRIVE" resizepart 1 ${PARTITION_SIZE}GB
+fi
 
 # Resize the NTFS filesystem
 echo "Resizing the NTFS filesystem on the destination partition..."
