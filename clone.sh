@@ -8,19 +8,156 @@ fi
 
 # Function to display usage
 usage() {
-  echo "Usage: $0 <source_drive> <destination_drive> <main_partition_size_in_GB>"
-  echo "Example: $0 /dev/sda /dev/sdb 100"
+  cat <<EOF
+Usage: $0 [options] <source_drive> <destination_drive> [main_partition_size_in_GB]
+
+Positional arguments:
+  source_drive                 Drive to clone (e.g. /dev/sda)
+  destination_drive            Drive to write clone to (e.g. /dev/sdb)
+  main_partition_size_in_GB    (optional) Size in GB to resize main partition to
+
+Options:
+  --calc-only                  Calculate the optimal main partition size (GB) and print it, then exit
+  --auto                       Calculate optimal size and use it for the resize (overrides provided size)
+  -h, --help                   Show this help message
+
+Examples:
+  # Calculate optimal size and print it
+  sudo $0 --calc-only /dev/sda /dev/sdb
+
+  # Calculate and use optimal size for resize
+  sudo $0 --auto /dev/sda /dev/sdb
+
+  # Use an explicit size
+  sudo $0 /dev/sda /dev/sdb 100
+EOF
   exit 1
 }
 
-# Check arguments
-if [[ $# -ne 3 ]]; then
+# Parse options and arguments
+CALC_ONLY=false
+AUTO=false
+SOURCE_DRIVE=""
+DEST_DRIVE=""
+PARTITION_SIZE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --calc-only)
+      CALC_ONLY=true; shift;;
+    --auto)
+      AUTO=true; shift;;
+    -h|--help)
+      usage;;
+    --) shift; break;;
+    -*)
+      echo "Unknown option: $1"; usage;;
+    *)
+      if [[ -z "$SOURCE_DRIVE" ]]; then
+        SOURCE_DRIVE=$1
+      elif [[ -z "$DEST_DRIVE" ]]; then
+        DEST_DRIVE=$1
+      elif [[ -z "$PARTITION_SIZE" ]]; then
+        PARTITION_SIZE=$1
+      else
+        echo "Too many arguments."; usage
+      fi
+      shift;;
+  esac
+done
+
+if [[ -z "$SOURCE_DRIVE" || -z "$DEST_DRIVE" ]]; then
   usage
 fi
 
-SOURCE_DRIVE=$1
-DEST_DRIVE=$2
-PARTITION_SIZE=$3
+# Helper to get partition path suffix (handles nvme/mmcblk naming)
+get_part() {
+  # get partition 1 of a drive in a safe way
+  local drive="$1"
+  if [[ "$drive" =~ nvme ]] || [[ "$drive" =~ mmcblk ]]; then
+    echo "${drive}p1"
+  else
+    echo "${drive}1"
+  fi
+}
+
+# Calculate optimal size (GB) for main NTFS partition on source drive
+calculate_optimal_gb() {
+  local src_part
+  src_part=$(get_part "$SOURCE_DRIVE")
+
+  if ! command -v ntfsresize >/dev/null 2>&1; then
+    echo "ntfsresize is required to calculate optimal size but was not found." >&2
+    return 1
+  fi
+
+  echo "Calculating optimal size for $src_part..." >&2
+  # Try ntfsresize info output first
+  local info
+  info=$(ntfsresize --info -f "$src_part" 2>&1 || true)
+
+  # Try to extract a minimum size in bytes from ntfsresize output
+  local bytes
+  bytes=$(echo "$info" | grep -iE 'minimum.*bytes|minimum size.*bytes|Estimated minimum' -i | sed -E 's/[^0-9]*([0-9]+).*/\1/' | head -n1)
+
+  # fallback: try to find large numeric value in output
+  if [[ -z "$bytes" ]]; then
+    bytes=$(echo "$info" | grep -oE '[0-9]{6,}' | head -n1)
+  fi
+
+  if [[ -n "$bytes" ]]; then
+    # Convert bytes -> GB (float), add margin (5% or 1 GB min), ceil to integer
+    local min_gb margin_gb optimal_gb
+    min_gb=$(awk "BEGIN{printf \"%f\", $bytes/1024/1024/1024}")
+    margin_gb=$(awk "BEGIN{m=$min_gb*0.05; if(m<1) m=1; printf \"%f\", m}")
+    optimal_gb=$(awk "BEGIN{printf \"%d\", int($min_gb + $margin_gb + 0.999999)}")
+    echo "$optimal_gb"
+    return 0
+  fi
+
+  # Last-resort: mount read-only and measure used bytes (may fail if in use)
+  local tmp used_bytes min_gb2 margin_gb2 opt2
+  tmp=$(mktemp -d)
+  if mount -o ro "$src_part" "$tmp" 2>/dev/null; then
+    used_bytes=$(du -s --block-size=1 "$tmp" 2>/dev/null | awk '{print $1}')
+    umount "$tmp" >/dev/null 2>&1 || true
+    rmdir "$tmp" >/dev/null 2>&1 || true
+    if [[ -n "$used_bytes" && "$used_bytes" -gt 0 ]]; then
+      min_gb2=$(awk "BEGIN{printf \"%f\", $used_bytes/1024/1024/1024}")
+      margin_gb2=$(awk "BEGIN{m=$min_gb2*0.05; if(m<1) m=1; printf \"%f\", m}")
+      opt2=$(awk "BEGIN{printf \"%d\", int($min_gb2 + $margin_gb2 + 0.999999)}")
+      echo "$opt2"
+      return 0
+    fi
+  else
+    rmdir "$tmp" >/dev/null 2>&1 || true
+  fi
+
+  echo "Unable to calculate optimal size for $src_part." >&2
+  return 1
+}
+
+# If requested, calculate and print size, or calculate and use it
+if [[ "$CALC_ONLY" == true ]]; then
+  if optimal=$(calculate_optimal_gb); then
+    echo "$optimal"
+    exit 0
+  else
+    echo "Failed to calculate optimal size." >&2
+    exit 2
+  fi
+fi
+
+if [[ "$AUTO" == true ]]; then
+  optimal=$(calculate_optimal_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
+  PARTITION_SIZE=$optimal
+  echo "Using calculated partition size: ${PARTITION_SIZE}GB"
+fi
+
+if [[ -z "$PARTITION_SIZE" ]]; then
+  echo "Main partition size (GB) not provided. Use --calc-only, --auto, or pass a size." >&2
+  usage
+fi
 
 # Confirm the drives
 echo "Source Drive: $SOURCE_DRIVE"
@@ -38,16 +175,36 @@ dd if=$SOURCE_DRIVE of=$DEST_DRIVE bs=512 count=1 conv=notrunc
 
 # Use ntfsclone to clone the NTFS partition
 echo "Cloning NTFS partition..."
-SOURCE_PARTITION="${SOURCE_DRIVE}1"
-DEST_PARTITION="${DEST_DRIVE}1"
-ntfsclone --overwrite $DEST_PARTITION $SOURCE_PARTITION
+SOURCE_PARTITION=$(get_part "$SOURCE_DRIVE")
+DEST_PARTITION=$(get_part "$DEST_DRIVE")
+
+# Confirm the drives
+echo "Source Drive: $SOURCE_DRIVE"
+echo "Source Partition: $SOURCE_PARTITION"
+echo "Destination Drive: $DEST_DRIVE"
+echo "Destination Partition: $DEST_PARTITION"
+echo "Main Partition Size: ${PARTITION_SIZE}GB"
+read -p "Are these details correct? (y/n): " CONFIRM
+if [[ $CONFIRM != "y" ]]; then
+  echo "Aborting."
+  exit 1
+fi
+
+# Clone the partition table using dd
+echo "Cloning partition table from $SOURCE_DRIVE to $DEST_DRIVE..."
+dd if=$SOURCE_DRIVE of=$DEST_DRIVE bs=512 count=1 conv=notrunc
+
+# Use ntfsclone to clone the NTFS partition
+echo "Cloning NTFS partition..."
+ntfsclone --overwrite "$DEST_PARTITION" "$SOURCE_PARTITION"
 
 # Resize the destination partition
 echo "Resizing the destination partition to ${PARTITION_SIZE}GB..."
-parted $DEST_DRIVE resizepart 1 ${PARTITION_SIZE}GB
+# parted uses partition number (1), not partition path
+parted "$DEST_DRIVE" resizepart 1 ${PARTITION_SIZE}GB
 
 # Resize the NTFS filesystem
 echo "Resizing the NTFS filesystem on the destination partition..."
-ntfsresize $DEST_PARTITION
+ntfsresize "$DEST_PARTITION"
 
 echo "Cloning and resizing complete!"

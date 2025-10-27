@@ -17,17 +17,31 @@ This script clones a source drive to a destination drive, resizes the main parti
 Run the script with the following syntax:
 
 ```bash
-sudo ./clone.sh <source_drive> <destination_drive> <main_partition_size_in_GB>
+sudo ./clone.sh [options] <source_drive> <destination_drive> [main_partition_size_in_GB]
 ```
 
-### Example
+The script supports the following modes:
+
+- Explicit size: pass the desired main partition size in GB as the third positional argument.
+- Automatic calculation: use `--auto` to let the script calculate an optimal size and use it for the resize.
+- Calculate-only: use `--calc-only` to calculate the optimal size and print it, without making changes.
+
+### Examples
+
 ```bash
+# Calculate optimal size and print it (no changes made)
+sudo ./clone.sh --calc-only /dev/sda /dev/sdb
+
+# Calculate optimal size and use it to resize the destination
+sudo ./clone.sh --auto /dev/sda /dev/sdb
+
+# Use an explicit size
 sudo ./clone.sh /dev/sda /dev/sdb 100
 ```
 
 - `<source_drive>`: The drive you want to clone (e.g., `/dev/sda`).
 - `<destination_drive>`: The drive where the clone will be written (e.g., `/dev/sdb`).
-- `<main_partition_size_in_GB>`: The size of the main partition on the destination drive in gigabytes.
+- `<main_partition_size_in_GB>`: (optional) The size of the main partition on the destination drive in gigabytes. If omitted, use `--auto` to compute it.
 
 ---
 
@@ -63,6 +77,12 @@ Reboot the system and verify that Windows boots correctly from the cloned drive.
 - The script assumes the source drive has a single NTFS partition. If your drive has multiple partitions, additional steps may be required.
 - If the cloned drive does not boot, ensure the partition flags are set correctly using `parted` or `diskpart`.
 - This script does not handle non-NTFS filesystems.
+
+Notes about the calculation:
+
+- The script tries to use `ntfsresize --info` to determine the minimum required size for the NTFS filesystem. If successful it adds a small margin (5% or at least 1 GB) and returns a rounded-up value in GB.
+- If `ntfsresize` cannot provide the info, the script will attempt a read-only mount of the source partition and measure used bytes as a fallback. This may fail if the partition is in use.
+- `ntfsresize` and `ntfsclone` must be installed for the calculation and cloning to function.
 
 ---
 
