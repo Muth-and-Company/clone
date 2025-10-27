@@ -207,6 +207,8 @@ calculate_optimal_gb() {
     umount "$tmp" >/dev/null 2>&1 || true
     rmdir "$tmp" >/dev/null 2>&1 || true
     if [[ -n "$used_bytes" && "$used_bytes" -gt 0 ]]; then
+      # expose the measured used bytes so callers can align partition sizing
+      CALC_BYTES=$used_bytes
       min_gb2=$(awk "BEGIN{printf \"%f\", $used_bytes/1024/1024/1024}")
       margin_gb2=$(awk "BEGIN{m=$min_gb2*0.05; if(m<1) m=1; printf \"%f\", m}")
       opt2=$(awk "BEGIN{printf \"%d\", int($min_gb2 + $margin_gb2 + 0.999999)}")
