@@ -276,6 +276,7 @@ compute_recommended_gb() {
     return 1
   fi
   # export CALC_BYTES for later sector math
+  # We'll return a canonical "bytes:GB" for the recommended size; keep needed_bytes for calcs
   CALC_BYTES=$needed_bytes
 
   # Determine destination total bytes
@@ -362,11 +363,14 @@ compute_recommended_gb() {
     # safety floor
     if [[ $recommended -gt $dest_gb ]]; then recommended=$dest_gb; fi
     if [[ $recommended -lt 1 ]]; then recommended=1; fi
+    # compute recommended bytes for returning to caller
+    recommended_bytes=$(awk "BEGIN{printf \"%d\", $recommended * 1024 * 1024 * 1024}")
     if [[ "$DRY_RUN" == true ]]; then
-      echo "Fill mode: start_sector=$start_sector, start_bytes=${start_bytes:-0}, dest_bytes=$dest_bytes, reserve_bytes=$reserve_bytes" 
-      echo "Recommended target (GB): $recommended"
+      echo "Fill mode: start_sector=$start_sector, start_bytes=${start_bytes:-0}, dest_bytes=$dest_bytes, reserve_bytes=$reserve_bytes" >&2
+      echo "Recommended target (GB): $recommended" >&2
+      echo "Source needed (bytes): $needed_bytes" >&2
     fi
-    echo "$recommended"
+    echo "${recommended_bytes}:${recommended}"
     return 0
   fi
 
@@ -377,26 +381,31 @@ compute_recommended_gb() {
     recommended=$needed_gb_int
   fi
 
-  # If dry-run, print details to stdout for easy capture
+  # compute recommended bytes and return bytes:GB. Print diagnostics to stderr when dry-run.
+  recommended_bytes=$(awk "BEGIN{printf \"%d\", $recommended * 1024 * 1024 * 1024}")
   if [[ "$DRY_RUN" == true ]]; then
-    echo "Source needed (GB): $needed_gb_int"
-    echo "Source needed (bytes): $needed_bytes"
-    echo "Destination capacity (GB): $dest_gb"
-    echo "Recommended target (GB): $recommended"
+    echo "Source needed (GB): $needed_gb_int" >&2
+    echo "Source needed (bytes): $needed_bytes" >&2
+    echo "Destination capacity (GB): $dest_gb" >&2
+    echo "Recommended target (GB): $recommended" >&2
   fi
-
-  echo "$recommended"
+  echo "${recommended_bytes}:${recommended}"
 }
 
 # Recreate destination partition layout and clone partitions safely.
 # This automated mode supports a common 3-partition layout: p1 small, p2 main NTFS, p3 small.
 recreate_and_clone() {
   echo "Running recreate-and-clone mode (safe automated)." >&2
-  # Ensure we have needed values
-  out=$(calculate_optimal_gb) || { echo "Failed to calculate optimal size." >&2; return 1; }
-  needed_bytes=$(echo "$out" | awk -F: '{print $1}')
-  needed_gb=$(echo "$out" | awk -F: '{print $2}')
-  CALC_BYTES=$needed_bytes
+  # Ensure we have needed values; prefer CALC_BYTES already computed by caller
+  if [[ -z "$CALC_BYTES" ]]; then
+    out=$(calculate_optimal_gb) || { echo "Failed to calculate optimal size." >&2; return 1; }
+    needed_bytes=$(echo "$out" | awk -F: '{print $1}')
+    needed_gb=$(echo "$out" | awk -F: '{print $2}')
+    CALC_BYTES=$needed_bytes
+  else
+    needed_bytes=$CALC_BYTES
+    needed_gb=$(awk "BEGIN{printf \"%d\", int($CALC_BYTES/1024/1024/1024)}")
+  fi
 
   # Detect source drive base (strip partition number)
   if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
@@ -500,6 +509,9 @@ recreate_and_clone() {
 
   if [[ $final_main_end -lt $main_start ]]; then
     echo "Not enough space on destination to accommodate the requested size and preserve trailing partitions." >&2
+    echo "DEBUG: dest_total_sectors=$dest_total_sectors sector_size=$sector_size" >&2
+    echo "DEBUG: main_start=$main_start needed_sectors=$needed_sectors candidate_end=$candidate_end" >&2
+    echo "DEBUG: trailing_total=$trailing_total available_end=$available_end final_main_end=$final_main_end" >&2
     return 1
   fi
 
@@ -595,24 +607,33 @@ recreate_and_clone() {
 
 # If requested, calculate and print size, or calculate and use it
 if [[ "$CALC_ONLY" == true ]]; then
-  if recommended=$(compute_recommended_gb 2>/dev/null); then
-    echo "$recommended"
-    exit 0
-  else
-    echo "Failed to calculate optimal size." >&2
-    exit 2
-  fi
+  out=$(compute_recommended_gb 2>/dev/null) || { echo "Failed to calculate optimal size." >&2; exit 2; }
+  # compute_recommended_gb returns bytes:GB
+  echo "$out" | awk -F: '{print $2}'
+  exit 0
 fi
 
 if [[ "$AUTO" == true ]]; then
-  recommended=$(compute_recommended_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
+  out=$(compute_recommended_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
+  CALC_BYTES=$(echo "$out" | awk -F: '{print $1}')
+  recommended=$(echo "$out" | awk -F: '{print $2}')
   PARTITION_SIZE=$recommended
   echo "Using calculated partition size: ${PARTITION_SIZE}GB"
 fi
 
 if [[ "$RECREATE" == true ]]; then
-  recommended=$(compute_recommended_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
-  PARTITION_SIZE=$recommended
+  # If AUTO already calculated CALC_BYTES/ PARTITION_SIZE, reuse them; otherwise compute once
+  if [[ -z "$CALC_BYTES" ]]; then
+    out=$(compute_recommended_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
+    CALC_BYTES=$(echo "$out" | awk -F: '{print $1}')
+    recommended=$(echo "$out" | awk -F: '{print $2}')
+    PARTITION_SIZE=$recommended
+  else
+    # ensure PARTITION_SIZE is set from existing CALC_BYTES if not already
+    if [[ -z "$PARTITION_SIZE" ]]; then
+      PARTITION_SIZE=$(awk "BEGIN{printf \"%d\", int($CALC_BYTES/1024/1024/1024)}")
+    fi
+  fi
   echo "Running recreate-and-clone with target ${PARTITION_SIZE}GB (dry-run=$DRY_RUN)"
   recreate_and_clone || { echo "Recreate-and-clone failed." >&2; exit 1; }
   exit 0
