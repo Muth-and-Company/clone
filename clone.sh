@@ -96,16 +96,56 @@ calculate_optimal_gb() {
   local info
   info=$(ntfsresize --info -f "$src_part" 2>&1 || true)
 
-  # Try to extract a minimum size in bytes from ntfsresize output
-  local bytes
-  bytes=$(echo "$info" | grep -iE 'minimum.*bytes|minimum size.*bytes|Estimated minimum' -i | sed -E 's/[^0-9]*([0-9]+).*/\1/' | head -n1)
-
-  # fallback: try to find large numeric value in output
-  if [[ -z "$bytes" ]]; then
-    bytes=$(echo "$info" | grep -oE '[0-9]{6,}' | head -n1)
+  # Try to parse a number and unit from lines mentioning minimum/estimated
+  local bytes=""
+  local line parsed num unit ss largest
+  line=$(echo "$info" | grep -iE 'minimum|estimated minimum|you might' | head -n1 || true)
+  if [[ -n "$line" ]]; then
+    parsed=$(echo "$line" | sed -nE 's/.*?([0-9]+) ?([A-Za-z]+)?.*/\1 \2/p' || true)
+    num=$(echo "$parsed" | awk '{print $1}' 2>/dev/null || echo "")
+    unit=$(echo "$parsed" | awk '{print $2}' 2>/dev/null || echo "")
+    unit=$(echo "$unit" | tr '[:upper:]' '[:lower:]')
+    if [[ -n "$num" ]]; then
+      case "$unit" in
+        sector*|sectors)
+          ss=$(blockdev --getss "$src_part" 2>/dev/null || blockdev --getss "${SOURCE_DRIVE}" 2>/dev/null || echo 512)
+          bytes=$(awk "BEGIN{printf \"%d\", $num * $ss}")
+          ;;
+        byte*|bytes|b|)
+          bytes=$num
+          ;;
+        kb|k|kbyte|kbytes)
+          bytes=$(awk "BEGIN{printf \"%d\", $num * 1024}")
+          ;;
+        mb|m|mbyte|mbytes)
+          bytes=$(awk "BEGIN{printf \"%d\", $num * 1024 * 1024}")
+          ;;
+        gb|g|gbyte|gbytes)
+          bytes=$(awk "BEGIN{printf \"%d\", $num * 1024 * 1024 * 1024}")
+          ;;
+        *)
+          # Unknown unit: just take the raw number for now
+          bytes=$num
+          ;;
+      esac
+    fi
   fi
 
-  if [[ -n "$bytes" ]]; then
+  # fallback: pick the largest numeric token from ntfsresize output
+  if [[ -z "$bytes" || "$bytes" -lt 1073741824 ]]; then
+    largest=$(echo "$info" | grep -oE '[0-9]+' | awk '{ if($1>m) m=$1 } END{print m+0}' )
+    if [[ -n "$largest" && "$largest" -gt 0 ]]; then
+      # If largest looks small (likely sectors), try to convert using sector size
+      if [[ "$largest" -lt 1000000 ]]; then
+        ss=$(blockdev --getss "$src_part" 2>/dev/null || blockdev --getss "${SOURCE_DRIVE}" 2>/dev/null || echo 512)
+        bytes=$(awk "BEGIN{printf \"%d\", $largest * $ss}")
+      else
+        bytes=$largest
+      fi
+    fi
+  fi
+
+  if [[ -n "$bytes" && "$bytes" -gt 0 ]]; then
     # Convert bytes -> GB (float), add margin (5% or 1 GB min), ceil to integer
     local min_gb margin_gb optimal_gb
     min_gb=$(awk "BEGIN{printf \"%f\", $bytes/1024/1024/1024}")
