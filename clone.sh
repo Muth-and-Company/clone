@@ -99,11 +99,12 @@ calculate_optimal_gb() {
   if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
     src_part=$SOURCE_DRIVE
   else
-    # Try to auto-detect an NTFS partition on the source drive using lsblk
+    # Try to auto-detect the largest NTFS partition on the source drive using lsblk
     if command -v lsblk >/dev/null 2>&1; then
-      detected=$(lsblk -nr -o NAME,FSTYPE "$SOURCE_DRIVE" 2>/dev/null | awk '$2 ~ /ntfs/ {print "/dev/" $1; exit}')
+      detected=$(lsblk -bnr -o NAME,FSTYPE,SIZE "$SOURCE_DRIVE" 2>/dev/null | awk '$2=="ntfs"{print $1" "$3}' | sort -k2 -n | tail -n1)
       if [[ -n "$detected" ]]; then
-        src_part=$detected
+        name=$(echo "$detected" | awk '{print $1}')
+        src_part="/dev/$name"
       else
         # fallback to partition 1
         src_part=$(get_part "$SOURCE_DRIVE")
@@ -128,7 +129,7 @@ calculate_optimal_gb() {
   local line parsed num unit ss largest
   line=$(echo "$info" | grep -iE 'bytes' | head -n1 || true)
   if [[ -n "$line" ]]; then
-    # use greedy .* to capture the large byte value (avoid non-greedy '?')
+    # use greedy .* to capture the large byte value
     parsed=$(echo "$line" | sed -nE 's/.*([0-9]+) ?bytes.*/\1/p' || true)
     if [[ -n "$parsed" ]]; then
       bytes=$parsed
@@ -239,22 +240,7 @@ if [[ -z "$PARTITION_SIZE" ]]; then
   usage
 fi
 
-# Confirm the drives
-echo "Source Drive: $SOURCE_DRIVE"
-echo "Destination Drive: $DEST_DRIVE"
-echo "Main Partition Size: ${PARTITION_SIZE}GB"
-read -p "Are these details correct? (y/n): " CONFIRM
-if [[ $CONFIRM != "y" ]]; then
-  echo "Aborting."
-  exit 1
-fi
-
-# Clone the partition table using dd
-echo "Cloning partition table from $SOURCE_DRIVE to $DEST_DRIVE..."
-dd if=$SOURCE_DRIVE of=$DEST_DRIVE bs=512 count=1 conv=notrunc
-
 # Use ntfsclone to clone the NTFS partition
-echo "Cloning NTFS partition..."
 # Determine partition number and construct matching partition paths
 PART_NUM=""
 if [[ "$SOURCE_DRIVE" =~ ([0-9]+)$ ]]; then
@@ -267,10 +253,12 @@ if [[ -n "$PART_NUM" && -b "$SOURCE_DRIVE" ]]; then
 else
   # default to partition 1 or try to detect NTFS partition
   if command -v lsblk >/dev/null 2>&1; then
-    detected=$(lsblk -nr -o NAME,FSTYPE "$SOURCE_DRIVE" 2>/dev/null | awk '$2 ~ /ntfs/ {print "/dev/" $1; exit}')
+    # pick largest NTFS partition by size (bytes)
+    detected=$(lsblk -bnr -o NAME,FSTYPE,SIZE "$SOURCE_DRIVE" 2>/dev/null | awk '$2=="ntfs"{print $1" "$3}' | sort -k2 -n | tail -n1)
     if [[ -n "$detected" ]]; then
-      SOURCE_PARTITION=$detected
-      if [[ "$detected" =~ ([0-9]+)$ ]]; then PART_NUM="${BASH_REMATCH[1]}"; fi
+      name=$(echo "$detected" | awk '{print $1}')
+      SOURCE_PARTITION="/dev/$name"
+      if [[ "$name" =~ ([0-9]+)$ ]]; then PART_NUM="${BASH_REMATCH[1]}"; fi
     else
       PART_NUM=1
       SOURCE_PARTITION=$(build_part "$SOURCE_DRIVE" "$PART_NUM")
