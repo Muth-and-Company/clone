@@ -37,6 +37,7 @@ EOF
 # Parse options and arguments
 CALC_ONLY=false
 AUTO=false
+DRY_RUN=false
 SOURCE_DRIVE=""
 DEST_DRIVE=""
 PARTITION_SIZE=""
@@ -47,6 +48,8 @@ while [[ $# -gt 0 ]]; do
       CALC_ONLY=true; shift;;
     --auto)
       AUTO=true; shift;;
+    --dry-run)
+      DRY_RUN=true; shift;;
     -h|--help)
       usage;;
     --) shift; break;;
@@ -218,10 +221,63 @@ calculate_optimal_gb() {
   return 1
 }
 
+# Compute recommended GB for destination: min(source-needed, destination-capacity)
+compute_recommended_gb() {
+  # Calculate source-needed GB and CALC_BYTES
+  needed_gb=$(calculate_optimal_gb) || return 1
+  needed_bytes=$CALC_BYTES
+
+  # Determine destination total bytes
+  dest_bytes=""
+  # Try parted header to get total sectors
+  if command -v parted >/dev/null 2>&1; then
+    header=$(parted -ms "$DEST_DRIVE" unit s print 2>/dev/null | head -n1 || true)
+    if [[ -n "$header" ]]; then
+      # header example: /dev/nvme0n1:1953525168s:... extract 2nd field
+      total_sectors=$(echo "$header" | awk -F: '{print $2}' | sed 's/s$//')
+      if [[ -n "$total_sectors" ]]; then
+        sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
+        dest_bytes=$(awk "BEGIN{printf \"%d\", $total_sectors * $sector_size}")
+      fi
+    fi
+  fi
+  # Fallback to blockdev --getsize64
+  if [[ -z "$dest_bytes" || "$dest_bytes" -le 0 ]]; then
+    if command -v blockdev >/dev/null 2>&1; then
+      dest_bytes=$(blockdev --getsize64 "$DEST_DRIVE" 2>/dev/null || echo "")
+    fi
+  fi
+  if [[ -z "$dest_bytes" || "$dest_bytes" -le 0 ]]; then
+    echo "Unable to determine destination disk capacity." >&2
+    return 1
+  fi
+
+  # Compute GBs
+  dest_gb=$(awk "BEGIN{printf \"%d\", int($dest_bytes/1024/1024/1024)}")
+  needed_gb_int=$(awk "BEGIN{printf \"%d\", int($needed_gb)}")
+
+  # recommended is min(needed_gb_int, dest_gb)
+  if [[ $needed_gb_int -gt $dest_gb ]]; then
+    recommended=$dest_gb
+  else
+    recommended=$needed_gb_int
+  fi
+
+  # If dry-run or verbose, print details
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "Source needed (GB): $needed_gb_int" >&2
+    echo "Source needed (bytes): $needed_bytes" >&2
+    echo "Destination capacity (GB): $dest_gb" >&2
+    echo "Recommended target (GB): $recommended" >&2
+  fi
+
+  echo "$recommended"
+}
+
 # If requested, calculate and print size, or calculate and use it
 if [[ "$CALC_ONLY" == true ]]; then
-  if optimal=$(calculate_optimal_gb); then
-    echo "$optimal"
+  if recommended=$(compute_recommended_gb 2>/dev/null); then
+    echo "$recommended"
     exit 0
   else
     echo "Failed to calculate optimal size." >&2
@@ -230,8 +286,8 @@ if [[ "$CALC_ONLY" == true ]]; then
 fi
 
 if [[ "$AUTO" == true ]]; then
-  optimal=$(calculate_optimal_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
-  PARTITION_SIZE=$optimal
+  recommended=$(compute_recommended_gb) || { echo "Failed to calculate optimal size." >&2; exit 2; }
+  PARTITION_SIZE=$recommended
   echo "Using calculated partition size: ${PARTITION_SIZE}GB"
 fi
 
