@@ -25,6 +25,8 @@ The script supports the following modes:
 - Explicit size: pass the desired main partition size in GB as the third positional argument.
 - Automatic calculation: use `--auto` to let the script calculate an optimal size and use it for the resize.
 - Calculate-only: use `--calc-only` to calculate the optimal size and print it, without making changes.
+ - Fill destination: use `--fill` with `--calc-only` or `--auto` to make the script choose a partition size that fills the destination disk (preserving the source partition start); useful when you want the cloned partition to occupy most of the destination drive.
+ - Dry-run / verbose calculation: use `--dry-run` with `--calc-only` to print internal calculation details (source needed bytes, destination capacity, recommended GB) without performing any changes.
 
 ### Examples
 
@@ -37,6 +39,12 @@ sudo ./clone.sh --auto /dev/sda /dev/sdb
 
 # Use an explicit size
 sudo ./clone.sh /dev/sda /dev/sdb 100
+
+# Calculate to fill the destination (recommended)
+sudo ./clone.sh --calc-only --fill --dry-run /dev/sda /dev/nvme0n1
+
+# Calculate and apply a resize that fills destination
+sudo ./clone.sh --auto --fill /dev/sda /dev/nvme0n1
 ```
 
 - `<source_drive>`: The drive you want to clone (e.g., `/dev/sda`).

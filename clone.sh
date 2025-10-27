@@ -19,14 +19,22 @@ Positional arguments:
 Options:
   --calc-only                  Calculate the optimal main partition size (GB) and print it, then exit
   --auto                       Calculate optimal size and use it for the resize (overrides provided size)
+  --fill                       Fill the destination disk (use available space) when calculating recommended size
+  --dry-run                    Show detailed calculation and recommended values without changing disks
   -h, --help                   Show this help message
 
 Examples:
   # Calculate optimal size and print it
   sudo $0 --calc-only /dev/sda /dev/sdb
 
+  # Calculate optimal size to fill the destination (use most of dest disk)
+  sudo $0 --calc-only --fill /dev/sda /dev/nvme0n1
+
   # Calculate and use optimal size for resize
   sudo $0 --auto /dev/sda /dev/sdb
+
+  # Calculate and use optimal size filling destination
+  sudo $0 --auto --fill /dev/sda /dev/nvme0n1
 
   # Use an explicit size
   sudo $0 /dev/sda /dev/sdb 100
@@ -38,6 +46,7 @@ EOF
 CALC_ONLY=false
 AUTO=false
 DRY_RUN=false
+FILL=false
 SOURCE_DRIVE=""
 DEST_DRIVE=""
 PARTITION_SIZE=""
@@ -48,6 +57,8 @@ while [[ $# -gt 0 ]]; do
       CALC_ONLY=true; shift;;
     --auto)
       AUTO=true; shift;;
+    --fill)
+      FILL=true; shift;;
     --dry-run)
       DRY_RUN=true; shift;;
     -h|--help)
@@ -291,6 +302,69 @@ compute_recommended_gb() {
   # Compute GBs
   dest_gb=$(awk "BEGIN{printf \"%d\", int($dest_bytes/1024/1024/1024)}")
   needed_gb_int=$(awk "BEGIN{printf \"%d\", int($needed_gb)}")
+
+  # If user requested filling the destination, compute available space after the partition start
+  if [[ "$FILL" == true ]]; then
+    # determine partition number on source (if user passed a partition path) or detect largest NTFS partition
+    src_part_num=""
+    src_part_name=""
+    if [[ "$SOURCE_DRIVE" =~ ([0-9]+)$ ]]; then
+      src_part_num="${BASH_REMATCH[1]}"
+      src_part_name=$(basename "$SOURCE_DRIVE")
+      # derive drive base (strip trailing partition number, handle nvme)
+      if [[ "$SOURCE_DRIVE" =~ (.*p)[0-9]+$ ]]; then
+        src_drive_base=${SOURCE_DRIVE%p${src_part_num}}
+      else
+        src_drive_base=${SOURCE_DRIVE%$src_part_num}
+      fi
+    else
+      # detect largest NTFS partition name
+      if command -v lsblk >/dev/null 2>&1; then
+        detected=$(lsblk -bnr -o NAME,FSTYPE,SIZE "$SOURCE_DRIVE" 2>/dev/null | awk '$2=="ntfs"{print $1" "$3}' | sort -k2 -n | tail -n1)
+        if [[ -n "$detected" ]]; then
+          src_part_name=$(echo "$detected" | awk '{print $1}')
+          if [[ "$src_part_name" =~ ([0-9]+)$ ]]; then src_part_num="${BASH_REMATCH[1]}"; fi
+          # drive base is /dev/<name without trailing number or pN>
+          src_drive_base="/dev/${src_part_name%${src_part_num}}"
+        fi
+      fi
+    fi
+
+    reserve_gb=1
+    reserve_bytes=$(awk "BEGIN{printf \"%d\", $reserve_gb * 1024 * 1024 * 1024}")
+
+    # default fallback: fill from sector 0 (full disk) minus reserve
+    if [[ -z "$src_part_num" || -z "$src_drive_base" ]]; then
+      recommended=$((dest_gb - reserve_gb))
+      if [[ $recommended -lt 1 ]]; then recommended=1; fi
+    else
+      # get start sector of the source partition
+      start_sector=$(parted -ms "$src_drive_base" unit s print 2>/dev/null | awk -F: -v ln="$((src_part_num+1))" 'NR==ln{print $2}')
+      if [[ -z "$start_sector" ]]; then
+        recommended=$((dest_gb - reserve_gb))
+      else
+        # compute start byte on dest using sector size
+        sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
+        start_sector_num=$(echo "$start_sector" | sed 's/s$//')
+        start_bytes=$(awk "BEGIN{printf \"%d\", $start_sector_num * $sector_size}")
+        available_bytes=$(awk "BEGIN{printf \"%d\", $dest_bytes - $start_bytes - $reserve_bytes}")
+        if [[ $available_bytes -lt 0 ]]; then
+          recommended=1
+        else
+          recommended=$(awk "BEGIN{printf \"%d\", int($available_bytes/1024/1024/1024)}")
+        fi
+      fi
+    fi
+    # safety floor
+    if [[ $recommended -gt $dest_gb ]]; then recommended=$dest_gb; fi
+    if [[ $recommended -lt 1 ]]; then recommended=1; fi
+    if [[ "$DRY_RUN" == true ]]; then
+      echo "Fill mode: start_sector=$start_sector, start_bytes=${start_bytes:-0}, dest_bytes=$dest_bytes, reserve_bytes=$reserve_bytes" 
+      echo "Recommended target (GB): $recommended"
+    fi
+    echo "$recommended"
+    return 0
+  fi
 
   # recommended is min(needed_gb_int, dest_gb)
   if [[ $needed_gb_int -gt $dest_gb ]]; then
