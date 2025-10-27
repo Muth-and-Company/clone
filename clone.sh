@@ -603,7 +603,17 @@ recreate_and_clone() {
         e=$max_end
       fi
       new_start[$i]=$s
-      new_end[$i]=$e
+      # Add a small margin (1MB) to avoid undersizing destination partitions
+      margin_sectors=$((2048))
+      e=$(( e + margin_sectors ))
+
+      # Ensure end sector does not exceed total sectors
+      max_end=$(( dest_total_sectors - 1 ))
+      if [[ $e -gt $max_end ]]; then
+        e=$max_end
+      fi
+    new_end[$i]=$e
+
     fi
   done
 
@@ -648,7 +658,6 @@ recreate_and_clone() {
     echo "Using MSDOS (MBR) label for compatibility (drive size ${dest_gb} GB)." >&2
     parted -s "$DEST_DRIVE" mklabel msdos
   fi
-
 
   # Build and show exact parted mkpart commands for safety
   declare -a mkcmds
