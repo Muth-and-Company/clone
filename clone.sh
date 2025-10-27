@@ -483,18 +483,21 @@ recreate_and_clone() {
   fi
 
   # Destination sizes
-  dest_header=$(parted -ms "$DEST_DRIVE" unit s print 2>/dev/null | head -n1)
-  dest_total_sectors=$(echo "$dest_header" | awk -F: '{print $2}' | sed 's/s$//')
+  # Destination sizes: prefer blockdev for total sectors (reliable), use parted as fallback
   sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
-
-  # Ensure dest_total_sectors is computed correctly
+  dest_total_sectors=0
+  if command -v blockdev >/dev/null 2>&1; then
+    dest_total_sectors=$(blockdev --getsz "$DEST_DRIVE" 2>/dev/null || echo 0)
+    echo "DEBUG: dest_total_sectors from blockdev=$dest_total_sectors" >&2
+  fi
+  # If blockdev didn't return a usable value, try parted header
   if [[ -z "$dest_total_sectors" || "$dest_total_sectors" -le 0 ]]; then
-    echo "DEBUG: dest_total_sectors is empty or invalid. Attempting fallback." >&2
-    if command -v blockdev >/dev/null 2>&1; then
-      dest_total_sectors=$(blockdev --getsz "$DEST_DRIVE" 2>/dev/null || echo 0)
-      echo "DEBUG: blockdev fallback returned dest_total_sectors=$dest_total_sectors" >&2
-    else
-      echo "DEBUG: blockdev command not found." >&2
+    echo "DEBUG: blockdev failed to provide total sectors; trying parted header." >&2
+    dest_header=$(parted -ms "$DEST_DRIVE" unit s print 2>/dev/null | head -n1 || true)
+    echo "DEBUG: parted header: $dest_header" >&2
+    if [[ -n "$dest_header" ]]; then
+      dest_total_sectors=$(echo "$dest_header" | awk -F: '{print $2}' | sed 's/s$//' || echo 0)
+      echo "DEBUG: dest_total_sectors from parted=$dest_total_sectors" >&2
     fi
   fi
 
