@@ -84,7 +84,23 @@ get_part() {
 # Calculate optimal size (GB) for main NTFS partition on source drive
 calculate_optimal_gb() {
   local src_part
-  src_part=$(get_part "$SOURCE_DRIVE")
+  # If SOURCE_DRIVE already points to a partition (e.g. /dev/nvme0n1p2 or /dev/sda1), use it
+  if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
+    src_part=$SOURCE_DRIVE
+  else
+    # Try to auto-detect an NTFS partition on the source drive using lsblk
+    if command -v lsblk >/dev/null 2>&1; then
+      detected=$(lsblk -nr -o NAME,FSTYPE "$SOURCE_DRIVE" 2>/dev/null | awk '$2 ~ /ntfs/ {print "/dev/" $1; exit}')
+      if [[ -n "$detected" ]]; then
+        src_part=$detected
+      else
+        # fallback to partition 1
+        src_part=$(get_part "$SOURCE_DRIVE")
+      fi
+    else
+      src_part=$(get_part "$SOURCE_DRIVE")
+    fi
+  fi
 
   if ! command -v ntfsresize >/dev/null 2>&1; then
     echo "ntfsresize is required to calculate optimal size but was not found." >&2
@@ -96,38 +112,48 @@ calculate_optimal_gb() {
   local info
   info=$(ntfsresize --info -f "$src_part" 2>&1 || true)
 
-  # Try to parse a number and unit from lines mentioning minimum/estimated
+  # Try to extract a byte count specifically (look for 'bytes')
   local bytes=""
   local line parsed num unit ss largest
-  line=$(echo "$info" | grep -iE 'minimum|estimated minimum|you might' | head -n1 || true)
+  line=$(echo "$info" | grep -iE 'bytes' | head -n1 || true)
   if [[ -n "$line" ]]; then
-    parsed=$(echo "$line" | sed -nE 's/.*?([0-9]+) ?([A-Za-z]+)?.*/\1 \2/p' || true)
-    num=$(echo "$parsed" | awk '{print $1}' 2>/dev/null || echo "")
-    unit=$(echo "$parsed" | awk '{print $2}' 2>/dev/null || echo "")
-    unit=$(echo "$unit" | tr '[:upper:]' '[:lower:]')
-    if [[ -n "$num" ]]; then
-      case "$unit" in
-        sector*|sectors)
-          ss=$(blockdev --getss "$src_part" 2>/dev/null || blockdev --getss "${SOURCE_DRIVE}" 2>/dev/null || echo 512)
-          bytes=$(awk "BEGIN{printf \"%d\", $num * $ss}")
-          ;;
-        byte*|bytes|b)
-          bytes=$num
-          ;;
-        kb|k|kbyte|kbytes)
-          bytes=$(awk "BEGIN{printf \"%d\", $num * 1024}")
-          ;;
-        mb|m|mbyte|mbytes)
-          bytes=$(awk "BEGIN{printf \"%d\", $num * 1024 * 1024}")
-          ;;
-        gb|g|gbyte|gbytes)
-          bytes=$(awk "BEGIN{printf \"%d\", $num * 1024 * 1024 * 1024}")
-          ;;
-        *)
-          # Unknown unit: just take the raw number for now
-          bytes=$num
-          ;;
-      esac
+    parsed=$(echo "$line" | sed -nE 's/.*?([0-9]+) ?bytes.*/\1/p' || true)
+    if [[ -n "$parsed" ]]; then
+      bytes=$parsed
+    fi
+  fi
+
+  # If we didn't get a 'bytes' token, try to capture an explicit MB/GB token on the min line
+  if [[ -z "$bytes" ]]; then
+    line=$(echo "$info" | grep -iE 'minimum|estimated minimum|you might' | head -n1 || true)
+    if [[ -n "$line" ]]; then
+      parsed=$(echo "$line" | sed -nE 's/.*([0-9]+) ?([A-Za-z]+).*/\1 \2/p' || true)
+      num=$(echo "$parsed" | awk '{print $1}' 2>/dev/null || echo "")
+      unit=$(echo "$parsed" | awk '{print $2}' 2>/dev/null || echo "")
+      unit=$(echo "$unit" | tr '[:upper:]' '[:lower:]')
+      if [[ -n "$num" ]]; then
+        case "$unit" in
+          sector*|sectors)
+            ss=$(blockdev --getss "$src_part" 2>/dev/null || blockdev --getss "${SOURCE_DRIVE}" 2>/dev/null || echo 512)
+            bytes=$(awk "BEGIN{printf \"%d\", $num * $ss}")
+            ;;
+          byte*|bytes|b)
+            bytes=$num
+            ;;
+          kb|k|kbyte|kbytes)
+            bytes=$(awk "BEGIN{printf \"%d\", $num * 1024}")
+            ;;
+          mb|m|mbyte|mbytes)
+            bytes=$(awk "BEGIN{printf \"%d\", $num * 1024 * 1024}")
+            ;;
+          gb|g|gbyte|gbytes)
+            bytes=$(awk "BEGIN{printf \"%d\", $num * 1024 * 1024 * 1024}")
+            ;;
+          *)
+            bytes=$num
+            ;;
+        esac
+      fi
     fi
   fi
 
