@@ -481,15 +481,15 @@ if [[ -n "$CALC_BYTES" && "$CALC_BYTES" -gt 0 ]]; then
     # compute needed sectors and end sector
     needed_sectors=$(awk "BEGIN{printf \"%d\", int( ($total_bytes + $sector_size - 1) / $sector_size )}")
     end_sector=$(awk "BEGIN{printf \"%d\", $start_sector + $needed_sectors - 1}")
-    echo "Resizing partition 1 to end at sector $end_sector (unit: sectors)" >&2
-    parted -s "$DEST_DRIVE" unit s resizepart 1 $end_sector || {
+    echo "Resizing partition $PART_NUM to end at sector $end_sector (unit: sectors)" >&2
+    parted -s "$DEST_DRIVE" unit s resizepart $PART_NUM $end_sector || {
       echo "Sector-based resize failed; trying GB-based resize as fallback." >&2
-      parted "$DEST_DRIVE" resizepart 1 ${PARTITION_SIZE}GB
+      parted "$DEST_DRIVE" resizepart $PART_NUM ${PARTITION_SIZE}GB
     }
   fi
 else
-  # parted uses partition number (1), not partition path
-  parted "$DEST_DRIVE" resizepart 1 ${PARTITION_SIZE}GB
+  # parted uses partition number, not partition path
+  parted "$DEST_DRIVE" resizepart $PART_NUM ${PARTITION_SIZE}GB
 fi
 
 # Resize the NTFS filesystem
