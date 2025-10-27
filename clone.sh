@@ -127,15 +127,44 @@ calculate_optimal_gb() {
   local info
   info=$(ntfsresize --info -f "$src_part" 2>&1 || true)
 
-  # Try to extract a byte count specifically (look for 'bytes')
+  # Try to extract a byte count from the suggested resize line (preferred)
   local bytes=""
   local line parsed num unit ss largest
-  line=$(echo "$info" | grep -iE 'bytes' | head -n1 || true)
+  line=$(echo "$info" | grep -iE 'you might resize at|you might resize|estimated minimum|minimum' | head -n1 || true)
   if [[ -n "$line" ]]; then
-    # use greedy .* to capture the large byte value
-    parsed=$(echo "$line" | sed -nE 's/.*([0-9]+) ?bytes.*/\1/p' || true)
+    parsed=$(echo "$line" | sed -nE 's/.*?([0-9]+) ?bytes.*/\1/p' || true)
     if [[ -n "$parsed" ]]; then
       bytes=$parsed
+    else
+      # try to capture MB/GB token on same line
+      parsed=$(echo "$line" | sed -nE 's/.*([0-9]+) ?([A-Za-z]+).*/\1 \2/p' || true)
+      num=$(echo "$parsed" | awk '{print $1}' 2>/dev/null || echo "")
+      unit=$(echo "$parsed" | awk '{print $2}' 2>/dev/null || echo "")
+      unit=$(echo "$unit" | tr '[:upper:]' '[:lower:]')
+      if [[ -n "$num" ]]; then
+        case "$unit" in
+          kb|k|kbyte|kbytes)
+            bytes=$(awk "BEGIN{printf \"%d\", $num * 1024}")
+            ;;
+          mb|m|mbyte|mbytes)
+            bytes=$(awk "BEGIN{printf \"%d\", $num * 1024 * 1024}")
+            ;;
+          gb|g|gbyte|gbytes)
+            bytes=$(awk "BEGIN{printf \"%d\", $num * 1024 * 1024 * 1024}")
+            ;;
+        esac
+      fi
+    fi
+  fi
+
+  # If we still didn't find a bytes token, fall back to the first bytes occurrence
+  if [[ -z "$bytes" ]]; then
+    line=$(echo "$info" | grep -iE 'bytes' | head -n1 || true)
+    if [[ -n "$line" ]]; then
+      parsed=$(echo "$line" | sed -nE 's/.*([0-9]+) ?bytes.*/\1/p' || true)
+      if [[ -n "$parsed" ]]; then
+        bytes=$parsed
+      fi
     fi
   fi
 
@@ -188,14 +217,13 @@ calculate_optimal_gb() {
   fi
 
   if [[ -n "$bytes" && "$bytes" -gt 0 ]]; then
-    # expose bytes globally so caller can compute sector-aligned partition end
-    CALC_BYTES=$bytes
     # Convert bytes -> GB (float), add margin (5% or 1 GB min), ceil to integer
     local min_gb margin_gb optimal_gb
     min_gb=$(awk "BEGIN{printf \"%f\", $bytes/1024/1024/1024}")
     margin_gb=$(awk "BEGIN{m=$min_gb*0.05; if(m<1) m=1; printf \"%f\", m}")
     optimal_gb=$(awk "BEGIN{printf \"%d\", int($min_gb + $margin_gb + 0.999999)}")
-    echo "$optimal_gb"
+    # Output in the form bytes:gb so callers can parse both values (we cannot rely on global vars when using command substitution)
+    echo "${bytes}:${optimal_gb}"
     return 0
   fi
 
@@ -207,12 +235,10 @@ calculate_optimal_gb() {
     umount "$tmp" >/dev/null 2>&1 || true
     rmdir "$tmp" >/dev/null 2>&1 || true
     if [[ -n "$used_bytes" && "$used_bytes" -gt 0 ]]; then
-      # expose the measured used bytes so callers can align partition sizing
-      CALC_BYTES=$used_bytes
       min_gb2=$(awk "BEGIN{printf \"%f\", $used_bytes/1024/1024/1024}")
       margin_gb2=$(awk "BEGIN{m=$min_gb2*0.05; if(m<1) m=1; printf \"%f\", m}")
       opt2=$(awk "BEGIN{printf \"%d\", int($min_gb2 + $margin_gb2 + 0.999999)}")
-      echo "$opt2"
+      echo "${used_bytes}:${opt2}"
       return 0
     fi
   else
@@ -225,9 +251,17 @@ calculate_optimal_gb() {
 
 # Compute recommended GB for destination: min(source-needed, destination-capacity)
 compute_recommended_gb() {
-  # Calculate source-needed GB and CALC_BYTES
-  needed_gb=$(calculate_optimal_gb) || return 1
-  needed_bytes=$CALC_BYTES
+  # Calculate source-needed GB and CALC_BYTES by parsing calculate_optimal_gb output (bytes:GB)
+  out=$(calculate_optimal_gb) || return 1
+  needed_bytes=$(echo "$out" | awk -F: '{print $1}')
+  needed_gb=$(echo "$out" | awk -F: '{print $2}')
+  # ensure numeric
+  if [[ -z "$needed_bytes" || -z "$needed_gb" ]]; then
+    echo "Failed to parse calculate_optimal_gb output: $out" >&2
+    return 1
+  fi
+  # export CALC_BYTES for later sector math
+  CALC_BYTES=$needed_bytes
 
   # Determine destination total bytes
   dest_bytes=""
