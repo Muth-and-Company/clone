@@ -263,12 +263,12 @@ compute_recommended_gb() {
     recommended=$needed_gb_int
   fi
 
-  # If dry-run or verbose, print details
+  # If dry-run, print details to stdout for easy capture
   if [[ "$DRY_RUN" == true ]]; then
-    echo "Source needed (GB): $needed_gb_int" >&2
-    echo "Source needed (bytes): $needed_bytes" >&2
-    echo "Destination capacity (GB): $dest_gb" >&2
-    echo "Recommended target (GB): $recommended" >&2
+    echo "Source needed (GB): $needed_gb_int"
+    echo "Source needed (bytes): $needed_bytes"
+    echo "Destination capacity (GB): $dest_gb"
+    echo "Recommended target (GB): $recommended"
   fi
 
   echo "$recommended"
