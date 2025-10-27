@@ -38,7 +38,7 @@ lsblk
 
 7) Run the cloning script with your desired drives and arguments
 ```bash
-sudo ./clone.sh --auto --fill /dev/sda /dev/nvme0n1
+sudo ./clone.sh --auto --recreate --fill /dev/sda /dev/nvme0n1
 ```
 
 8) Check the README for post-cloning instructions
