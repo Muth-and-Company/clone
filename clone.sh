@@ -434,6 +434,11 @@ recreate_and_clone() {
   while IFS= read -r line; do
     # parted -ms partition line format: num:start:end:size:fs:name:flags
     num=$(echo "$line" | awk -F: '{print $1}')
+    # skip non-numeric lines (defensive)
+    if ! echo "$num" | grep -qE '^[0-9]+$'; then
+      echo "DEBUG: skipping non-partition line: $line" >&2
+      continue
+    fi
     start=$(echo "$line" | awk -F: '{print $2}' | sed 's/s$//')
     end=$(echo "$line" | awk -F: '{print $3}' | sed 's/s$//')
     fs=$(echo "$line" | awk -F: '{print $5}')
@@ -562,9 +567,10 @@ recreate_and_clone() {
         s=$(( (s + 2047) / 2048 * 2048 ))
       fi
       e=$(( s + p_size[$i] - 1 ))
-      # Ensure end sector does not exceed total sectors
-      if [[ $e -gt $dest_total_sectors ]]; then
-        e=$dest_total_sectors
+      # Ensure end sector does not exceed total sectors (use dest_total_sectors-1 as last usable sector)
+      max_end=$(( dest_total_sectors - 1 ))
+      if [[ $e -gt $max_end ]]; then
+        e=$max_end
       fi
       new_start[$i]=$s
       new_end[$i]=$e
