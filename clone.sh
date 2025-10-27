@@ -411,68 +411,139 @@ recreate_and_clone() {
     echo "Failed to read source partition table." >&2
     return 1
   fi
-
-  # Count partitions
-  part_count=$(echo "$src_map" | wc -l)
-  # parted -ms prints header + one line per partition, so parts = lines-1
-  parts=$((part_count - 1))
-  if [[ $parts -ne 3 ]]; then
-    echo "Recreate mode currently supports a 3-partition source layout (p1/p2/p3). Detected $parts partitions." >&2
+  # Build a list of partition lines (skip header and empty lines)
+  map_lines=$(echo "$src_map" | sed -n '2,$p' | sed '/^\s*$/d')
+  parts=$(echo "$map_lines" | wc -l)
+  if [[ -z "$parts" || "$parts" -lt 1 ]]; then
+    echo "No partitions found on source." >&2
     return 1
   fi
 
-  # Parse partition lines
-  # header is line1; p1 line is NR==2, p2 NR==3, p3 NR==4
-  p1_line=$(echo "$src_map" | sed -n '2p')
-  p2_line=$(echo "$src_map" | sed -n '3p')
-  p3_line=$(echo "$src_map" | sed -n '4p')
+  # Parse partition entries into arrays for easy handling
+  declare -a p_start p_end p_fs p_num p_size
+  idx=0
+  while IFS= read -r line; do
+    # parted -ms partition line format: num:start:end:size:fs:name:flags
+    num=$(echo "$line" | awk -F: '{print $1}')
+    start=$(echo "$line" | awk -F: '{print $2}' | sed 's/s$//')
+    end=$(echo "$line" | awk -F: '{print $3}' | sed 's/s$//')
+    fs=$(echo "$line" | awk -F: '{print $5}')
+    size=$(( end - start + 1 ))
+    p_num[$idx]=$num
+    p_start[$idx]=$start
+    p_end[$idx]=$end
+    p_fs[$idx]=$fs
+    p_size[$idx]=$size
+    idx=$((idx+1))
+  done <<<"$map_lines"
 
-  p1_start=$(echo "$p1_line" | awk -F: '{print $2}' | sed 's/s$//')
-  p1_end=$(echo "$p1_line" | awk -F: '{print $3}' | sed 's/s$//')
-  p1_type=$(echo "$p1_line" | awk -F: '{print $6}')
+  parts=$idx
 
-  p2_start=$(echo "$p2_line" | awk -F: '{print $2}' | sed 's/s$//')
-  p2_end_src=$(echo "$p2_line" | awk -F: '{print $3}' | sed 's/s$//')
-  p2_type=$(echo "$p2_line" | awk -F: '{print $6}')
+  # Identify main partition: prefer NTFS, otherwise largest partition
+  main_idx=-1
+  for i in "$(seq 0 $((parts-1)))"; do
+    # expand seq output correctly in bash
+    :
+  done
+  for ((i=0;i<parts;i++)); do
+    fs=${p_fs[$i]}
+    if [[ -n "$fs" && "$fs" =~ ntfs ]]; then
+      main_idx=$i
+      break
+    fi
+  done
+  if [[ $main_idx -eq -1 ]]; then
+    # pick largest partition by sectors
+    maxsize=0
+    for ((i=0;i<parts;i++)); do
+      if [[ ${p_size[$i]} -gt $maxsize ]]; then
+        maxsize=${p_size[$i]}
+        main_idx=$i
+      fi
+    done
+  fi
 
-  p3_start=$(echo "$p3_line" | awk -F: '{print $2}' | sed 's/s$//')
-  p3_end=$(echo "$p3_line" | awk -F: '{print $3}' | sed 's/s$//')
-  p3_type=$(echo "$p3_line" | awk -F: '{print $6}')
+  if [[ $main_idx -eq -1 ]]; then
+    echo "Unable to identify main partition to resize." >&2
+    return 1
+  fi
 
   # Destination sizes
   dest_header=$(parted -ms "$DEST_DRIVE" unit s print 2>/dev/null | head -n1)
   dest_total_sectors=$(echo "$dest_header" | awk -F: '{print $2}' | sed 's/s$//')
   sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
 
-  # Compute needed sectors for p2
+  # Compute needed sectors for main partition from CALC_BYTES (add margin 5% or 1GiB)
   needed_sectors=$(awk "BEGIN{printf \"%d\", int( ($CALC_BYTES + ($CALC_BYTES*0.05) + 1073741824 -1) / $sector_size )}")
 
-  # compute p3 size in sectors
-  p3_size=$((p3_end - p3_start + 1))
+  # Compute total size (in sectors) of partitions after main (trailing partitions)
+  trailing_total=0
+  for ((i=main_idx+1;i<parts;i++)); do
+    trailing_total=$((trailing_total + p_size[$i]))
+  done
 
-  # compute new p2_end so that p3 can sit after it
-  new_p2_end=$(( dest_total_sectors - p3_size - 2048 ))
-  # prefer computed from needed_sectors starting at p2_start
-  candidate_end=$(( p2_start + needed_sectors - 1 ))
-  if [[ $candidate_end -le $new_p2_end ]]; then
-    final_p2_end=$candidate_end
+  # Reserve a small gap (2048 sectors) before trailing partitions
+  guard=2048
+
+  # Compute candidate main end if we start main at its original start
+  main_start=${p_start[$main_idx]}
+  candidate_end=$(( main_start + needed_sectors - 1 ))
+
+  # Available end to allow room for trailing partitions at the end of disk
+  available_end=$(( dest_total_sectors - trailing_total - guard ))
+
+  if [[ $candidate_end -le $available_end ]]; then
+    final_main_end=$candidate_end
   else
-    # shrink to fit available
-    final_p2_end=$new_p2_end
+    final_main_end=$available_end
   fi
 
-  # compute where p3 will start and end
-  new_p3_start=$(( final_p2_end + 1 ))
-  new_p3_end=$(( new_p3_start + p3_size - 1 ))
+  if [[ $final_main_end -lt $main_start ]]; then
+    echo "Not enough space on destination to accommodate the requested size and preserve trailing partitions." >&2
+    return 1
+  fi
 
+  # Compute new starts/ends for trailing partitions — pack them at the end in same order
+  new_trailing_start=$(( final_main_end + 1 ))
+  # But to keep trailing partitions at very end we compute first trailing partition start as dest_total_sectors - trailing_total +1
+  first_trailing_start=$(( dest_total_sectors - trailing_total + 1 ))
+
+  # Build planned layout array for destination
+  declare -a new_start new_end
+  for ((i=0;i<parts;i++)); do
+    if [[ $i -lt $main_idx ]]; then
+      # keep original start/end for partitions before main
+      new_start[$i]=${p_start[$i]}
+      new_end[$i]=${p_end[$i]}
+    elif [[ $i -eq $main_idx ]]; then
+      new_start[$i]=$main_start
+      new_end[$i]=$final_main_end
+    else
+      # trailing partitions: place sequentially starting at first_trailing_start
+      rel_index=$(( i - (main_idx+1) ))
+      # compute start for this trailing partition
+      if [[ $rel_index -eq 0 ]]; then
+        s=$first_trailing_start
+      else
+        # previous trailing end +1
+        prev=$(( i-1 ))
+        s=$(( new_end[$prev] + 1 ))
+      fi
+      e=$(( s + p_size[$i] - 1 ))
+      new_start[$i]=$s
+      new_end[$i]=$e
+    fi
+  done
+
+  # Print planned layout (human-friendly)
   echo "Planned layout (sectors):" >&2
-  echo "p1: $p1_start - $p1_end" >&2
-  echo "p2: $p2_start - $final_p2_end" >&2
-  echo "p3: $new_p3_start - $new_p3_end" >&2
+  for ((i=0;i<parts;i++)); do
+    echo "p${p_num[$i]}: ${new_start[$i]} - ${new_end[$i]} (fs=${p_fs[$i]})" >&2
+  done
 
   if [[ "$DRY_RUN" == true ]]; then
     echo "DRY-RUN: would back up partition table and create new partitions as above." >&2
-    echo "DRY-RUN: would clone p1 (dd), clone p2 (ntfsclone), clone p3 (dd) and run ntfsresize on p2." >&2
+    echo "DRY-RUN: would clone each partition (ntfsclone for NTFS, dd for others) and run ntfsresize on the main partition." >&2
     return 0
   fi
 
@@ -488,34 +559,35 @@ recreate_and_clone() {
   echo "Creating new partition table on $DEST_DRIVE..." >&2
   parted -s "$DEST_DRIVE" mklabel msdos
 
-  # create p1
-  parted -s "$DEST_DRIVE" unit s mkpart primary ${p1_start}s ${p1_end}s
-  # create p2
-  parted -s "$DEST_DRIVE" unit s mkpart primary ${p2_start}s ${final_p2_end}s
-  # create p3
-  parted -s "$DEST_DRIVE" unit s mkpart primary ${new_p3_start}s ${new_p3_end}s
+  # Create partitions according to new_start/new_end
+  for ((i=0;i<parts;i++)); do
+    s=${new_start[$i]}
+    e=${new_end[$i]}
+    echo "Creating partition p${p_num[$i]}: ${s}s - ${e}s" >&2
+    parted -s "$DEST_DRIVE" unit s mkpart primary ${s}s ${e}s
+  done
 
-  # copy p1 content
-  dest_p1=$(build_part "$DEST_DRIVE" 1)
-  src_p1=$(build_part "$src_drive_base" 1)
-  echo "Copying p1 from $src_p1 to $dest_p1..." >&2
-  dd if="$src_p1" of="$dest_p1" bs=4M conv=sync,notrunc status=progress
+  # Copy/clone partitions
+  for ((i=0;i<parts;i++)); do
+    src_part=$(build_part "$src_drive_base" ${p_num[$i]})
+    dest_part=$(build_part "$DEST_DRIVE" ${p_num[$i]})
+    fs=${p_fs[$i]}
+    echo "Processing partition ${p_num[$i]} (fs=${fs}): $src_part -> $dest_part" >&2
+    if [[ -n "$fs" && "$fs" =~ ntfs ]]; then
+      echo "Cloning NTFS partition $src_part -> $dest_part" >&2
+      ntfsclone --overwrite "$dest_part" "$src_part"
+      main_dest_part=$dest_part
+    else
+      echo "Copying partition $src_part -> $dest_part (dd)" >&2
+      dd if="$src_part" of="$dest_part" bs=4M conv=sync,notrunc status=progress || true
+    fi
+  done
 
-  # clone p2
-  dest_p2=$(build_part "$DEST_DRIVE" 2)
-  src_p2=$(build_part "$src_drive_base" 2)
-  echo "Cloning NTFS partition from $src_p2 to $dest_p2..." >&2
-  ntfsclone --overwrite "$dest_p2" "$src_p2"
-
-  # copy p3 content
-  dest_p3=$(build_part "$DEST_DRIVE" 3)
-  src_p3=$(build_part "$src_drive_base" 3)
-  echo "Copying p3 from $src_p3 to $dest_p3..." >&2
-  dd if="$src_p3" of="$dest_p3" bs=4M conv=sync,notrunc status=progress || true
-
-  # Resize filesystem
-  echo "Resizing NTFS filesystem on $dest_p2..." >&2
-  ntfsresize "$dest_p2"
+  # Resize filesystem on main partition (if we identified one)
+  if [[ -n "$main_dest_part" ]]; then
+    echo "Resizing filesystem on $main_dest_part" >&2
+    ntfsresize "$main_dest_part" || true
+  fi
 
   echo "Recreate-and-clone complete." >&2
   return 0
