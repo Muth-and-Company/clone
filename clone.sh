@@ -482,6 +482,22 @@ recreate_and_clone() {
   dest_total_sectors=$(echo "$dest_header" | awk -F: '{print $2}' | sed 's/s$//')
   sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
 
+  # Ensure dest_total_sectors is computed correctly
+  if [[ -z "$dest_total_sectors" || "$dest_total_sectors" -le 0 ]]; then
+    echo "DEBUG: dest_total_sectors is empty or invalid. Attempting fallback." >&2
+    if command -v blockdev >/dev/null 2>&1; then
+      dest_total_sectors=$(blockdev --getsz "$DEST_DRIVE" 2>/dev/null || echo 0)
+      echo "DEBUG: blockdev fallback returned dest_total_sectors=$dest_total_sectors" >&2
+    else
+      echo "DEBUG: blockdev command not found." >&2
+    fi
+  fi
+
+  if [[ -z "$dest_total_sectors" || "$dest_total_sectors" -le 0 ]]; then
+    echo "ERROR: Unable to determine destination disk total sectors." >&2
+    return 1
+  fi
+
   # Compute needed sectors for main partition from CALC_BYTES (add margin 5% or 1GiB)
   needed_sectors=$(awk "BEGIN{printf \"%d\", int( ($CALC_BYTES + ($CALC_BYTES*0.05) + 1073741824 -1) / $sector_size )}")
 
