@@ -632,9 +632,23 @@ recreate_and_clone() {
   sudo sfdisk -d "$DEST_DRIVE" > "${DEST_DRIVE##*/}.partitions.sfdisk" 2>/dev/null || true
   sudo dd if="$DEST_DRIVE" of="${DEST_DRIVE##*/}.mbr.bin" bs=512 count=2048 2>/dev/null || true
 
-  # Create new partition table
+  # Decide whether to use GPT or MSDOS based on destination size
   echo "Creating new partition table on $DEST_DRIVE..." >&2
-  parted -s "$DEST_DRIVE" mklabel msdos
+
+  sector_size=$(blockdev --getss "$DEST_DRIVE" 2>/dev/null || echo 512)
+  dest_total_sectors=$(blockdev --getsz "$DEST_DRIVE" 2>/dev/null || echo 0)
+  dest_bytes=$(( dest_total_sectors * sector_size ))
+  dest_gb=$(( dest_bytes / 1024 / 1024 / 1024 ))
+
+  # Use GPT for large drives (>900GB) or NVMe devices, else msdos
+  if [[ "$dest_gb" -gt 900 || "$DEST_DRIVE" =~ nvme ]]; then
+    echo "Detected large drive ($dest_gb GB) or NVMe device — using GPT label." >&2
+    parted -s "$DEST_DRIVE" mklabel gpt
+  else
+    echo "Using MSDOS (MBR) label for compatibility (drive size ${dest_gb} GB)." >&2
+    parted -s "$DEST_DRIVE" mklabel msdos
+  fi
+
 
   # Build and show exact parted mkpart commands for safety
   declare -a mkcmds
