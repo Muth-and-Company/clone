@@ -559,6 +559,15 @@ recreate_and_clone() {
 
   # Build parted commands and execute
   mkcmds=()
+
+  # determine src base so we can detect source roles for each partition
+  if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
+    src_drive_base=$(echo "$SOURCE_DRIVE" | sed -E 's/(p?[0-9]+)$//')
+  else
+    src_drive_base=$SOURCE_DRIVE
+  fi
+  dest_drive_base=$DEST_DRIVE
+
   for ((i=0;i<parts;i++)); do
     s=${new_start[$i]}
     e=${new_end[$i]}
@@ -566,8 +575,41 @@ recreate_and_clone() {
       echo "ERROR: bad range for partition ${p_num[$i]}: $s >= $e. Aborting." >&2
       return 1
     fi
-    # parted expects ranges in sectors with 's' suffix
-    cmd=(parted -s "$DEST_DRIVE" unit s mkpart primary "${s}s" "${e}s")
+
+    # infer desired fs/type token for parted mkpart from the source partition role / known fs
+    fs_token=""
+    src_part_guess=$(build_part "$src_drive_base" "${p_num[$i]}")
+    role_guess=$(detect_partition_role "$src_part_guess" || echo "other")
+    case "$role_guess" in
+      efi)
+        fs_token="fat32"
+        ;;
+      ntfs)
+        fs_token="ntfs"
+        ;;
+      msr)
+        # parted recognizes msftres / msftreserves on some versions; use msftres if supported,
+        # otherwise create partition without fs token and leave unformatted.
+        fs_token="msftres"
+        ;;
+      *)
+        # if parted reported fs in p_fs[], prefer that mapping
+        pf="${p_fs[$i]:-}"
+        if [[ -n "$pf" ]]; then
+          pf=$(echo "$pf" | tr '[:upper:]' '[:lower:]')
+          if [[ "$pf" =~ fat|vfat ]]; then fs_token="fat32"; fi
+          if [[ "$pf" =~ ntfs ]]; then fs_token="ntfs"; fi
+        fi
+        # fallback: leave empty to create generic type (but avoid this for Windows-critical partitions)
+        ;;
+    esac
+
+    if [[ -n "$fs_token" ]]; then
+      cmd=(parted -s "$DEST_DRIVE" unit s mkpart primary "$fs_token" "${s}s" "${e}s")
+    else
+      cmd=(parted -s "$DEST_DRIVE" unit s mkpart primary "${s}s" "${e}s")
+    fi
+
     mkcmds[$i]="${cmd[*]}"
     echo "MKPART: ${mkcmds[$i]}" >&2
   done
