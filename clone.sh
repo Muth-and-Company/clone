@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# safer-clone.sh
-# Replacement of your previous script — preserves CLI but fixes partition/formatting issues.
-# Usage and options same as original script. See usage() below.
 
 set -euo pipefail
 
