@@ -1,6 +1,6 @@
 # Drive Cloning Script
 
-This script clones a source drive to a destination drive, resizes the main partition, and adjusts the NTFS filesystem to fit the resized partition. It is designed for use with NTFS-formatted drives.
+This script clones a source drive to a destination drive, resizes the main partition, and adjusts the NTFS filesystem to fit the resized partition. It is designed for use with GPT-labeled, NTFS-formatted drives.
 
 ---
 
