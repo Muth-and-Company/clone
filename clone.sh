@@ -501,12 +501,20 @@ recreate_and_clone() {
         prev=$(( i-1 ))
         s=$(( new_end[$prev] + 1 ))
       fi
+
+      # Align each start to 2048-sector (1 MiB) boundary for performance
+      if (( s % 2048 != 0 )); then
+        s=$(( (s + 2047) / 2048 * 2048 ))
+      fi
+
       psz=${p_size[$i]:-0}
       e=$(( s + psz - 1 ))
+
       if [[ $e -gt $usable_last_sector ]]; then
         echo "ERROR: insufficient space for trailing partition ${p_num[$i]}; required end $e > usable last $usable_last_sector" >&2
         return 1
       fi
+
       new_start[$i]=$s
       new_end[$i]=$e
     fi
