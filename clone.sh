@@ -228,16 +228,28 @@ read_source_partitions() {
     base="$src"
   fi
 
-  src_map=$(parted -ms "$base" unit s print 2>/dev/null)
+  local src_map
+  src_map=$(parted -ms "$base" unit s print 2>/dev/null || true)
   if [[ -z "$src_map" ]]; then
     echo "Failed to read source partition table via parted." >&2
     return 1
   fi
 
-  map_lines=$(echo "$src_map" | sed -n '2,$p' | sed '/^\s*$/d')
-  idx=0
-  unset p_num p_start p_end p_fs p_flags p_name p_size
-  declare -a p_num p_start p_end p_fs p_flags p_name p_size
+  local map_lines
+  map_lines=$(echo "$src_map" | sed -n '2,$p' | sed '/^\s*$/d' || true)
+
+  # initialize global arrays so they exist outside the function (avoid unbound vars)
+  p_num=()
+  p_start=()
+  p_end=()
+  p_fs=()
+  p_flags=()
+  p_name=()
+  p_size=()
+  parts=0
+
+  local idx=0
+  local line num start end fs name flags size
 
   while IFS= read -r line; do
     # parted partition format: num:start:end:size:fs:name:flags
@@ -250,17 +262,23 @@ read_source_partitions() {
     fs=$(echo "$line" | awk -F: '{print $5}')
     name=$(echo "$line" | awk -F: '{print $6}')
     flags=$(echo "$line" | awk -F: '{print $7}')
+    # ensure numeric arithmetic safe
+    if [[ -z "$start" || -z "$end" ]]; then
+      continue
+    fi
     size=$(( end - start + 1 ))
-    p_num[$idx]=$num
-    p_start[$idx]=$start
-    p_end[$idx]=$end
-    p_fs[$idx]=$fs
-    p_name[$idx]=$name
-    p_flags[$idx]=$flags
-    p_size[$idx]=$size
+    p_num+=("$num")
+    p_start+=("$start")
+    p_end+=("$end")
+    p_fs+=("$fs")
+    p_name+=("$name")
+    p_flags+=("$flags")
+    p_size+=("$size")
     idx=$((idx+1))
   done <<<"$map_lines"
+
   parts=$idx
+  return 0
 }
 
 # Decide partition role (EFI/MSR/NTFS/OTHER) using blkid/lsblk and heuristics
