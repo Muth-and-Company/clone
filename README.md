@@ -1,6 +1,6 @@
 # Drive Cloning Script
 
-This script clones a source drive to a destination drive, resizes the main partition, and adjusts the NTFS filesystem to fit the resized partition. It is designed for use with NTFS-formatted drives.
+This script clones a source drive to a destination drive, resizes the main partition, and adjusts the NTFS filesystem to fit the resized partition. It is designed for use with GPT-labeled, NTFS-formatted drives.
 
 ---
 
@@ -37,6 +37,21 @@ Recreate behavior and safety notes:
 - When `--recreate` runs it will print the exact `parted` mkpart commands the script will execute (in `--dry-run` they are shown but not executed). When run without `--dry-run` you will be prompted to confirm the mkpart execution. Use `--yes` to skip the prompts.
 - The script creates backups before destructive actions: a `sfdisk` dump named `<disk>.partitions.sfdisk` and an initial disk image `<disk>.mbr.bin` (first 2048 sectors). Verify those files exist before proceeding.
 
+### Important Caveats
+
+This script is intended to aid in the replacement of old PCs that cannot make it to Windows 11 while retaining all personal data. 
+IMPORTANT: Check if you are on Legacy with msinfo32
+If you are on Legacy, before you clone, make sure to convert to GPT by running
+```cmd
+mbr2gpt /validate /allowfullos
+mbr2gpt /convert /allowfullos
+```
+If on the live ISO you may need to provide a /drive option:
+```cmd
+mbr2gpt /validate /disk:0
+mbr2gpt /convert /disk:0
+```
+
 ### Examples
 
 ```bash
@@ -71,20 +86,18 @@ After running the script, additional steps are required to ensure the cloned dri
 - Select **Repair your computer** > **Troubleshoot** > **Advanced options** > **Command Prompt**.
 
 ### 2. Run Boot Repair Commands
-Run the following commands in the recovery environment:
+Find your main NTFS partition and your FAT32 partition. If there is no FAT32 partition, your source drive may have been installed on Legacy instead of GPT.
 ```cmd
-bootrec /rebuildbcd bootrec /fixmbr bootrec /fixboot
+diskpart
+list vol
 ```
 
-### 3. Mark the Partition as Active
-Use `diskpart` to mark the main partition as active:
+Then run this command to replace the boot entry files
 ```cmd
-diskpart select disk <destination_disk> select partition <partition_number> active exit
+bcdboot {NTFS DRIVE LETTER}:\Windows /s {FAT32 DRIVE LETTER} /f UEFI
 ```
 
-Replace `<destination_disk>` and `<partition_number>` with the appropriate values for your cloned drive.
-
-### 4. Restart and Test
+### 3. Restart and Test
 Reboot the system and verify that Windows boots correctly from the cloned drive.
 
 ---
