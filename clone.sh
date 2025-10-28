@@ -542,16 +542,20 @@ recreate_and_clone() {
   sfdisk -d "$DEST_DRIVE" >"${DEST_DRIVE##*/}.partitions.sfdisk" 2>/dev/null || true
   dd if="$DEST_DRIVE" of="${DEST_DRIVE##*/}.mbr.bin" bs=512 count=2048 2>/dev/null || true
 
-  # choose label type
-  dest_bytes=$(( dest_total_sectors * sector_size ))
-  dest_gb=$(( dest_bytes / 1024 / 1024 / 1024 ))
-  if [[ "$dest_gb" -gt 900 || "$DEST_DRIVE" =~ nvme ]]; then
-    echo "Using GPT on destination."
-    parted -s "$DEST_DRIVE" mklabel gpt
-  else
-    echo "Using msdos label on destination."
-    parted -s "$DEST_DRIVE" mklabel msdos
+  # If desired_label was set earlier (from source partition table), use it.
+  # Otherwise decide based on disk size / NVMe heuristic.
+  if [[ -z "${desired_label:-}" ]]; then
+    dest_bytes=$(( dest_total_sectors * sector_size ))
+    dest_gb=$(( dest_bytes / 1024 / 1024 / 1024 ))
+    if [[ "$dest_gb" -gt 900 || "$DEST_DRIVE" =~ nvme ]]; then
+      desired_label="gpt"
+    else
+      desired_label="msdos"
+    fi
   fi
+
+  echo "Using $desired_label on destination."
+  parted -s "$DEST_DRIVE" mklabel "$desired_label"
 
   # Build parted commands and execute
   mkcmds=()
