@@ -407,7 +407,60 @@ recreate_and_clone() {
   guard=2048
   main_start=${p_start[$main_idx]}
   candidate_end=$(( main_start + needed_sectors - 1 ))
-  available_end=$(( dest_total_sectors - trailing_total - guard - 1 ))
+
+  # Prefer to keep source partition-table type; detect source base and label
+  if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
+    src_base=$(echo "$SOURCE_DRIVE" | sed -E 's/(p?[0-9]+)$//')
+  else
+    src_base="$SOURCE_DRIVE"
+  fi
+  src_label=$(parted -ms "$src_base" unit s print 2>/dev/null | head -n1 | awk -F: '{print $6}' || true)
+  src_label=$(echo "${src_label:-}" | tr '[:upper:]' '[:lower:]')
+
+  # Decide destination label: prefer source label when known; otherwise fallback to size heuristic
+  if [[ "$src_label" == "gpt" || "$src_label" == "msdos" ]]; then
+    desired_label="$src_label"
+  else
+    dest_bytes=$(( dest_total_sectors * sector_size ))
+    dest_gb=$(( dest_bytes / 1024 / 1024 / 1024 ))
+    if [[ "$dest_gb" -gt 900 || "$DEST_DRIVE" =~ nvme ]]; then
+      desired_label="gpt"
+    else
+      desired_label="msdos"
+    fi
+  fi
+
+  # detect current destination label and warn if changing
+  current_dest_label=$(parted -ms "$DEST_DRIVE" unit s print 2>/dev/null | head -n1 | awk -F: '{print $6}' || true)
+  current_dest_label=$(echo "${current_dest_label:-}" | tr '[:upper:]' '[:lower:]')
+  if [[ -n "$current_dest_label" && "$current_dest_label" != "$desired_label" ]]; then
+    echo "Warning: converting destination partition-table from '$current_dest_label' -> '$desired_label' (this will overwrite partition table)." >&2
+    if [[ "$YES" != true ]]; then
+      read -p "Proceed with conversion? (y/n): " _ok
+      if [[ "$_ok" != "y" ]]; then
+        echo "Aborting per user request." >&2
+        return 1
+      fi
+    else
+      echo "Auto-confirmed (--yes): converting to $desired_label" >&2
+    fi
+  fi
+
+  echo "Using $desired_label on destination."
+  parted -s "$DEST_DRIVE" mklabel "$desired_label"
+
+  # If GPT we must avoid writing into the GPT backup/header area at the end.
+  if [[ "$desired_label" == "gpt" ]]; then
+    # reserve conservative GPT backup/header region
+    gpt_reserved_sectors=34
+  else
+    gpt_reserved_sectors=0
+  fi
+  usable_last_sector=$(( dest_total_sectors - 1 - gpt_reserved_sectors ))
+
+  # compute available end for main partition (stop before trailing partitions)
+  first_trailing_start=$(( usable_last_sector - trailing_total + 1 ))
+  available_end=$(( first_trailing_start - guard - 1 ))
 
   if [[ $candidate_end -le $available_end ]]; then
     final_main_end=$candidate_end
@@ -420,10 +473,8 @@ recreate_and_clone() {
     return 1
   fi
 
-  # compute new starts/ends
+  # compute new starts/ends (preserve trailing partition sizes exactly)
   declare -a new_start new_end
-  # compute first_trailing_start to place trailing partitions at disk end
-  first_trailing_start=$(( dest_total_sectors - trailing_total + 1 ))
   for ((i=0;i<parts;i++)); do
     if [[ $i -lt $main_idx ]]; then
       new_start[$i]=${p_start[$i]}
@@ -432,22 +483,18 @@ recreate_and_clone() {
       new_start[$i]=$main_start
       new_end[$i]=$final_main_end
     else
-      rel_index=$(( i - (main_idx+1) ))
-      if [[ $rel_index -eq 0 ]]; then
+      # place trailing partitions contiguously ending at usable_last_sector
+      if [[ $i -eq $(( main_idx + 1 )) ]]; then
         s=$first_trailing_start
       else
         prev=$(( i-1 ))
         s=$(( new_end[$prev] + 1 ))
       fi
-      # align to 2048 sectors
-      if [[ $(( s % 2048 )) -ne 0 ]]; then
-        s=$(( (s + 2047) / 2048 * 2048 ))
-      fi
       e=$(( s + p_size[$i] - 1 ))
-      # small margin
-      e=$(( e + 2048 ))
-      if [[ $e -gt $(( dest_total_sectors - 1 )) ]]; then
-        e=$(( dest_total_sectors - 1 ))
+      # sanity check: do not exceed usable_last_sector
+      if [[ $e -gt $usable_last_sector ]]; then
+        echo "ERROR: insufficient space for trailing partition ${p_num[$i]}; required end $e > usable last $usable_last_sector" >&2
+        return 1
       fi
       new_start[$i]=$s
       new_end[$i]=$e
