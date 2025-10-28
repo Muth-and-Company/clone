@@ -417,7 +417,8 @@ recreate_and_clone() {
   # compute trailing partitions sectors (sectors count stored in p_size array)
   trailing_total=0
   for ((i=main_idx+1;i<parts;i++)); do
-    trailing_total=$(( trailing_total + (p_size[$i]:-0) ))
+    val=${p_size[$i]:-0}
+    trailing_total=$(( trailing_total + val ))
   done
 
   guard=2048
@@ -503,7 +504,8 @@ recreate_and_clone() {
         prev=$(( i-1 ))
         s=$(( new_end[$prev] + 1 ))
       fi
-      e=$(( s + (p_size[$i]:-0) - 1 ))
+      psz=${p_size[$i]:-0}
+      e=$(( s + psz - 1 ))
       if [[ $e -gt $usable_last_sector ]]; then
         echo "ERROR: insufficient space for trailing partition ${p_num[$i]}; required end $e > usable last $usable_last_sector" >&2
         return 1
