@@ -323,9 +323,23 @@ detect_partition_role() {
   echo "$role"
 }
 
-# Recreate and clone with correct formatting/flags
 recreate_and_clone() {
   echo "Running recreate-and-clone mode (safe automated)." >&2
+
+  # Safety: resolve and ensure source != dest (prevent overwriting source)
+  src_real=$(readlink -f "${SOURCE_DRIVE}")
+  dst_real=$(readlink -f "${DEST_DRIVE}")
+  if [[ "$src_real" == "$dst_real" ]]; then
+    echo "ERROR: source and destination resolve to the same device ($src_real). Aborting." >&2
+    return 1
+  fi
+  # Prevent same physical disk (e.g. /dev/sda vs /dev/sda1)
+  src_base_real=$(readlink -f "$(echo "${SOURCE_DRIVE}" | sed -E 's/(p?[0-9]+)$//')")
+  dst_base_real=$(readlink -f "$(echo "${DEST_DRIVE}" | sed -E 's/(p?[0-9]+)$//')")
+  if [[ "$src_base_real" == "$dst_base_real" ]]; then
+    echo "ERROR: destination appears to be the same physical disk as source ($src_base_real). Aborting." >&2
+    return 1
+  fi
 
   # compute sizes if needed
   if [[ -z "${CALC_BYTES:-}" ]]; then
@@ -341,7 +355,7 @@ recreate_and_clone() {
   # read source partitions
   read_source_partitions "$SOURCE_DRIVE" || { echo "Failed to read source partitions." >&2; return 1; }
 
-  if [[ $parts -lt 1 ]]; then
+  if [[ ${parts:-0} -lt 1 ]]; then
     echo "No partitions found on source." >&2
     return 1
   fi
@@ -350,17 +364,14 @@ recreate_and_clone() {
   main_idx=-1
   max_ntfs_size=0
   for ((i=0;i<parts;i++)); do
-    # build device path
     src_base="$SOURCE_DRIVE"
     if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
       src_base=$(echo "$SOURCE_DRIVE" | sed -E 's/(p?[0-9]+)$//')
     fi
     src_part_dev=$(build_part "$src_base" "${p_num[$i]}")
-    # detect role
     role=$(detect_partition_role "$src_part_dev" || echo "other")
-    # if ntfs prefer largest
     if [[ "$role" == "ntfs" ]]; then
-      if [[ ${p_size[$i]} -gt $max_ntfs_size ]]; then
+      if [[ ${p_size[$i]:-0} -gt $max_ntfs_size ]]; then
         max_ntfs_size=${p_size[$i]}
         main_idx=$i
       fi
@@ -368,30 +379,13 @@ recreate_and_clone() {
   done
 
   if [[ $main_idx -eq -1 ]]; then
-    # pick largest by sector size
     maxsize=0
     for ((i=0;i<parts;i++)); do
-      if [[ ${p_size[$i]} -gt $maxsize ]]; then
+      if [[ ${p_size[$i]:-0} -gt $maxsize ]]; then
         maxsize=${p_size[$i]}
         main_idx=$i
       fi
     done
-  fi
-
-  if [[ -n "$MAIN_PART_OVERRIDE" ]]; then
-    forced_index=-1
-    for ((i=0;i<parts;i++)); do
-      if [[ "${p_num[$i]}" == "$MAIN_PART_OVERRIDE" ]]; then
-        forced_index=$i
-        break
-      fi
-    done
-    if [[ $forced_index -ne -1 ]]; then
-      echo "Forcing main partition to source partition number ${MAIN_PART_OVERRIDE} (index $forced_index)" >&2
-      main_idx=$forced_index
-    else
-      echo "WARN: --main-part ${MAIN_PART_OVERRIDE} not found on source; ignoring." >&2
-    fi
   fi
 
   if [[ $main_idx -eq -1 ]]; then
@@ -399,7 +393,7 @@ recreate_and_clone() {
     return 1
   fi
 
-  # Determine dest total sectors
+  # Determine destination sector geometry
   if ! command -v blockdev >/dev/null 2>&1; then
     echo "blockdev missing, cannot compute destination sectors." >&2
     return 1
@@ -419,7 +413,7 @@ recreate_and_clone() {
   # compute trailing partitions sectors (sectors count stored in p_size array)
   trailing_total=0
   for ((i=main_idx+1;i<parts;i++)); do
-    trailing_total=$(( trailing_total + p_size[$i] ))
+    trailing_total=$(( trailing_total + (p_size[$i]:-0) ))
   done
 
   guard=2048
@@ -464,12 +458,10 @@ recreate_and_clone() {
     fi
   fi
 
-  echo "Using $desired_label on destination."
-  parted -s "$DEST_DRIVE" mklabel "$desired_label"
+  echo "Planned destination label: $desired_label" >&2
 
-  # If GPT we must avoid writing into the GPT backup/header area at the end.
+  # compute usable end taking GPT backup into account
   if [[ "$desired_label" == "gpt" ]]; then
-    # reserve conservative GPT backup/header region
     gpt_reserved_sectors=34
   else
     gpt_reserved_sectors=0
@@ -501,15 +493,13 @@ recreate_and_clone() {
       new_start[$i]=$main_start
       new_end[$i]=$final_main_end
     else
-      # place trailing partitions contiguously ending at usable_last_sector
       if [[ $i -eq $(( main_idx + 1 )) ]]; then
         s=$first_trailing_start
       else
         prev=$(( i-1 ))
         s=$(( new_end[$prev] + 1 ))
       fi
-      e=$(( s + p_size[$i] - 1 ))
-      # sanity check: do not exceed usable_last_sector
+      e=$(( s + (p_size[$i]:-0) - 1 ))
       if [[ $e -gt $usable_last_sector ]]; then
         echo "ERROR: insufficient space for trailing partition ${p_num[$i]}; required end $e > usable last $usable_last_sector" >&2
         return 1
@@ -537,30 +527,17 @@ recreate_and_clone() {
   fi
   if [[ "$ok" != "y" ]]; then echo "Aborting."; return 1; fi
 
-  # backup destination partition table (both GPT and MBR region)
+  # backup destination partition table
   echo "Backing up destination partition table..."
   sfdisk -d "$DEST_DRIVE" >"${DEST_DRIVE##*/}.partitions.sfdisk" 2>/dev/null || true
   dd if="$DEST_DRIVE" of="${DEST_DRIVE##*/}.mbr.bin" bs=512 count=2048 2>/dev/null || true
 
-  # If desired_label was set earlier (from source partition table), use it.
-  # Otherwise decide based on disk size / NVMe heuristic.
-  if [[ -z "${desired_label:-}" ]]; then
-    dest_bytes=$(( dest_total_sectors * sector_size ))
-    dest_gb=$(( dest_bytes / 1024 / 1024 / 1024 ))
-    if [[ "$dest_gb" -gt 900 || "$DEST_DRIVE" =~ nvme ]]; then
-      desired_label="gpt"
-    else
-      desired_label="msdos"
-    fi
-  fi
+  # create label once
+  echo "Creating label $desired_label on $DEST_DRIVE"
+  parted -s "$DEST_DRIVE" mklabel "$desired_label" || { echo "Failed to mklabel $DEST_DRIVE"; return 1; }
 
-  echo "Using $desired_label on destination."
-  parted -s "$DEST_DRIVE" mklabel "$desired_label"
-
-  # Build parted commands and execute
+  # Build parted mkpart commands (do not pass invalid token 'msftres')
   mkcmds=()
-
-  # determine src base so we can detect source roles for each partition
   if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
     src_drive_base=$(echo "$SOURCE_DRIVE" | sed -E 's/(p?[0-9]+)$//')
   else
@@ -571,53 +548,36 @@ recreate_and_clone() {
   for ((i=0;i<parts;i++)); do
     s=${new_start[$i]}
     e=${new_end[$i]}
-    if (( s >= e )); then
-      echo "ERROR: bad range for partition ${p_num[$i]}: $s >= $e. Aborting." >&2
-      return 1
-    fi
-
-    # infer desired fs/type token for parted mkpart from the source partition role / known fs
-    fs_token=""
     src_part_guess=$(build_part "$src_drive_base" "${p_num[$i]}")
     role_guess=$(detect_partition_role "$src_part_guess" || echo "other")
+    fs_token=""
     case "$role_guess" in
-      efi)
-        fs_token="fat32"
-        ;;
-      ntfs)
-        fs_token="ntfs"
-        ;;
-      msr)
-        # parted recognizes msftres / msftreserves on some versions; use msftres if supported,
-        # otherwise create partition without fs token and leave unformatted.
-        fs_token="msftres"
-        ;;
-      *)
-        # if parted reported fs in p_fs[], prefer that mapping
+      efi) fs_token="fat32";;
+      ntfs) fs_token="ntfs";;
+      msr) fs_token="";;   # leave empty, we'll set GPT type GUID later if needed
+      *) 
         pf="${p_fs[$i]:-}"
         if [[ -n "$pf" ]]; then
           pf=$(echo "$pf" | tr '[:upper:]' '[:lower:]')
           if [[ "$pf" =~ fat|vfat ]]; then fs_token="fat32"; fi
           if [[ "$pf" =~ ntfs ]]; then fs_token="ntfs"; fi
         fi
-        # fallback: leave empty to create generic type (but avoid this for Windows-critical partitions)
         ;;
     esac
 
     if [[ -n "$fs_token" ]]; then
-      cmd=(parted -s "$DEST_DRIVE" unit s mkpart primary "$fs_token" "${s}s" "${e}s")
+      mkcmds+=("parted -s \"$DEST_DRIVE\" unit s mkpart primary $fs_token ${s}s ${e}s")
     else
-      cmd=(parted -s "$DEST_DRIVE" unit s mkpart primary "${s}s" "${e}s")
+      mkcmds+=("parted -s \"$DEST_DRIVE\" unit s mkpart primary ${s}s ${e}s")
     fi
-
-    mkcmds[$i]="${cmd[*]}"
-    echo "MKPART: ${mkcmds[$i]}" >&2
+    echo "MKPART: ${mkcmds[-1]}" >&2
   done
 
+  # Execute mkpart commands
   echo "Executing partition creation commands..."
   for cmd in "${mkcmds[@]}"; do
     echo "RUN: $cmd" >&2
-    eval "$cmd"
+    eval "$cmd" || { echo "Partition creation failed: $cmd" >&2; return 1; }
   done
 
   # inform kernel
@@ -625,31 +585,43 @@ recreate_and_clone() {
   udevadm settle --timeout=10 || true
   sleep 1
 
-  # Now, for each partition, wipe dest signatures and copy appropriate contents
-  # Determine src base and dest base for partition path building
-  if [[ -b "$SOURCE_DRIVE" && ( "$SOURCE_DRIVE" =~ [0-9]$ || "$SOURCE_DRIVE" =~ p[0-9]+$ ) ]]; then
-    src_drive_base=$(echo "$SOURCE_DRIVE" | sed -E 's/(p?[0-9]+)$//')
-  else
-    src_drive_base=$SOURCE_DRIVE
+  # If GPT and sgdisk present, set Microsoft GUIDs for Windows partitions
+  if command -v sgdisk >/dev/null 2>&1 && [[ "${desired_label:-}" == "gpt" ]]; then
+    for ((i=0;i<parts;i++)); do
+      src_part_guess=$(build_part "$src_drive_base" "${p_num[$i]}")
+      role_guess=$(detect_partition_role "$src_part_guess" || echo "other")
+      partnum=${p_num[$i]}
+      case "$role_guess" in
+        efi)
+          sgdisk --typecode="${partnum}:ef00" "$DEST_DRIVE" >/dev/null 2>&1 || true
+          ;;
+        msr)
+          sgdisk --typecode="${partnum}:E3C9E316-0B5C-4DB8-817D-F92DF00215AE" "$DEST_DRIVE" >/dev/null 2>&1 || true
+          ;;
+        ntfs)
+          sgdisk --typecode="${partnum}:EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" "$DEST_DRIVE" >/dev/null 2>&1 || true
+          ;;
+        *)
+          ;;
+      esac
+    done
   fi
-  dest_drive_base=$DEST_DRIVE
 
-  # We'll set main_dest_part variable for later resize/ntfsresize
-  main_dest_part=""
-  main_src_part=""
+  # inform kernel again after typecode changes
+  partprobe "$DEST_DRIVE" || true
+  udevadm settle --timeout=10 || true
+  sleep 1
 
+  # Copy/format partitions
   for ((i=0;i<parts;i++)); do
     src_part=$(build_part "$src_drive_base" "${p_num[$i]}")
     dest_part=$(build_part "$dest_drive_base" "${p_num[$i]}")
     role=$(detect_partition_role "$src_part" || echo "other")
     echo "Processing partition ${p_num[$i]}: role=$role src=$src_part dest=$dest_part" >&2
 
-    # wipe dest signatures to avoid confusion
-    if [[ -b "$dest_part" ]]; then
-      echo "Wiping signatures on $dest_part"
-      wipefs -a "$dest_part" || true
-    else
-      echo "Destination partition $dest_part not present in kernel; waiting and re-probing..."
+    # ensure dest partition present in kernel
+    if [[ ! -b "$dest_part" ]]; then
+      echo "Destination partition $dest_part not present; re-probing..."
       partprobe "$DEST_DRIVE"
       udevadm settle --timeout=10
       sleep 1
@@ -657,70 +629,70 @@ recreate_and_clone() {
         echo "ERROR: destination partition $dest_part still missing." >&2
         return 1
       fi
-      wipefs -a "$dest_part" || true
     fi
+
+    # wipe dest signatures
+    wipefs -a "$dest_part" >/dev/null 2>&1 || true
 
     case "$role" in
       efi)
-        echo "Creating FAT32 on $dest_part and setting esp flag"
-        mkfs.fat -F32 "$dest_part"
-        # set esp flag for partition number
+        echo "Formatting $dest_part as FAT32 and setting esp flag"
+        mkfs.fat -F32 "$dest_part" >/dev/null 2>&1 || { echo "mkfs.fat failed on $dest_part" >&2; return 1; }
         parted -s "$DEST_DRIVE" set "${p_num[$i]}" esp on || true
         ;;
       msr)
-        # Microsoft Reserved: leave unformatted, just create partition — Windows expects no filesystem.
         echo "MSR/reserved partition: leaving unformatted (no fs)."
-        # ensure no fs created
         ;;
       ntfs)
-        if ! command -v ntfsclone >/dev/null 2>&1; then
-          echo "ntfsclone missing; falling back to dd for NTFS copy (may be slower and copy live data)." >&2
-          dd if="$src_part" of="$dest_part" bs=4M conv=sync,notrunc status=progress || true
-        else
+        # verify dest partition size can hold the source NTFS used size
+        if command -v ntfsclone >/dev/null 2>&1; then
+          used_bytes=$(ntfsclone --info -s "$src_part" 2>&1 | awk -F: '/Accounting clusters/ {getline; getline} /Space in use/ {print $0}' || true)
+          # fallback: parse ntfsclone --info full output for 'Space in use' line
+          space_in_use=$(ntfsclone --info "$src_part" 2>&1 | awk -F: '/Space in use/ {print $2}' | awk '{print $1}' || true)
+          # best-effort: get device size
+          dest_bytes=$(blockdev --getsize64 "$dest_part" 2>/dev/null || true)
+          src_bytes=$(blockdev --getsize64 "$src_part" 2>/dev/null || true)
+          if [[ -n "$dest_bytes" && -n "$src_bytes" ]]; then
+            # if dest is smaller than source device size, complain
+            if [[ "$dest_bytes" -lt "$src_bytes" ]]; then
+              echo "ERROR: Destination partition $dest_part is smaller than source $src_part. Aborting clone for safety." >&2
+              return 1
+            fi
+          fi
           echo "Cloning NTFS via ntfsclone: $src_part -> $dest_part"
-          # ntfsclone requires destination device to be empty: we already wiped signatures.
-          ntfsclone --overwrite "$dest_part" "$src_part"
-          # remember main if this is main partition index
+          ntfsclone --overwrite "$dest_part" "$src_part" || { echo "ntfsclone failed for $src_part -> $dest_part" >&2; return 1; }
+        else
+          echo "ntfsclone missing; falling back to dd for NTFS copy"
+          dd if="$src_part" of="$dest_part" bs=4M conv=sync,notrunc status=progress || true
         fi
         ;;
-      other)
-        # Default: raw dd copy
-        echo "Copying partition raw via dd: $src_part -> $dest_part"
+      *)
+        echo "Copying raw: $src_part -> $dest_part"
         dd if="$src_part" of="$dest_part" bs=4M conv=sync,notrunc status=progress || true
         ;;
     esac
-
-    # record main partition device path
-    if [[ $i -eq $main_idx ]]; then
-      main_dest_part="$dest_part"
-      main_src_part="$src_part"
-    fi
   done
 
-  # After copying partitions, ensure kernel sees them
+  # final kernel sync and optional resize
   partprobe "$DEST_DRIVE" || true
   udevadm settle --timeout=10 || true
   sleep 1
 
-  # resize the partition table entry (if we decided target main size earlier)
-  # Determine PART_NUM for main (original partition number)
+  # Resize partition table entry for main if needed (sector-based)
   PART_NUM=${p_num[$main_idx]}
   if [[ -n "$PART_NUM" ]]; then
-    echo "Resizing partition number $PART_NUM on $DEST_DRIVE to match planned end (${new_end[$main_idx]}) (sector unit)"
-    # use parted with sector units
+    echo "Resizing partition number $PART_NUM on $DEST_DRIVE to planned end (${new_end[$main_idx]})"
     parted -s "$DEST_DRIVE" unit s resizepart "$PART_NUM" "${new_end[$main_idx]}" || true
   fi
 
-  # If main partition is NTFS, run ntfsresize to finalize
-  if [[ -n "$main_dest_part" ]]; then
-    role_main=$(detect_partition_role "$main_src_part" || echo "other")
-    if [[ "$role_main" == "ntfs" ]]; then
-      if command -v ntfsresize >/dev/null 2>&1; then
-        echo "Running ntfsresize on $main_dest_part"
-        ntfsresize "$main_dest_part" || true
-      else
-        echo "ntfsresize missing; main partition may require manual resizing in Windows." >&2
-      fi
+  # If main is NTFS, run ntfsresize to finalize filesystem
+  main_src=$(build_part "$src_base" "${p_num[$main_idx]}")
+  main_dest=$(build_part "$dest_drive_base" "${p_num[$main_idx]}")
+  if [[ -n "$main_dest" ]]; then
+    role_main=$(detect_partition_role "$main_src" || echo "other")
+    if [[ "$role_main" == "ntfs" && -x "$(command -v ntfsresize 2>/dev/null || true)" ]]; then
+      echo "Running ntfsresize on $main_dest"
+      ntfsresize "$main_dest" || true
     fi
   fi
 
