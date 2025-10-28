@@ -511,8 +511,12 @@ recreate_and_clone() {
       e=$(( s + psz - 1 ))
 
       if [[ $e -gt $usable_last_sector ]]; then
-        echo "ERROR: insufficient space for trailing partition ${p_num[$i]}; required end $e > usable last $usable_last_sector" >&2
-        return 1
+        diff=$(( e - usable_last_sector ))
+        echo "Warning: trailing partition ${p_num[$i]} exceeds disk by $diff sectors (~$(( diff * sector_size / 1024 )) KiB). Adjusting main partition smaller to fit." >&2
+        # shrink main partition end by diff + safety (2048 sectors)
+        shrink=$(( diff + 2048 ))
+        new_end[$main_idx]=$(( new_end[$main_idx] - shrink ))
+        e=$usable_last_sector
       fi
 
       new_start[$i]=$s
