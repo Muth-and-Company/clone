@@ -281,7 +281,6 @@ read_source_partitions() {
   return 0
 }
 
-# Decide partition role (EFI/MSR/NTFS/OTHER) using blkid/lsblk and heuristics
 detect_partition_role() {
   # args: device (e.g. /dev/sda1)
   local dev="$1"
@@ -301,7 +300,7 @@ detect_partition_role() {
       role="other"
     fi
   fi
-  # Heuristics on label/parttype/size
+  # Heuristics on label/parttype
   if [[ -n "$label" ]]; then
     l=$(echo "$label" | tr '[:upper:]' '[:lower:]')
     if [[ "$l" =~ efi|esp|efi\ system ]]; then role="efi"; fi
@@ -311,15 +310,20 @@ detect_partition_role() {
     pt=$(echo "$parttype" | tr '[:upper:]' '[:lower:]')
     if [[ "$pt" =~ efi ]]; then role="efi"; fi
   fi
-  # final fallback: if size small (<= 1GiB) and not ntfs, it might be MSR/ESP
-  local bytes
-  bytes=$(parted -ms "$(dirname "$dev")" unit B print | awk -F: -v n="${dev##*/}" 'NR>1 { if ($1==n) print $4 }' | sed 's/B$//' || true)
+
+  # Use partition base (strip trailing partition number) instead of dirname
+  local base devnum bytes
+  devnum="${dev##*/}"
+  base=$(echo "$dev" | sed -E 's/(p?[0-9]+)$//')
+
+  # final fallback: if size small (<= 1GiB) and role still "other", treat as msr
+  bytes=$(parted -ms "$base" unit B print 2>/dev/null | awk -F: -v n="$devnum" 'NR>1 { if ($1==n) print $4 }' | sed 's/B$//' || true)
   if [[ -n "$bytes" ]]; then
     if [[ "$bytes" -le $((1024*1024*1024)) && "$role" == "other" ]]; then
-      # small partition; could be MSR — signal as msr to avoid formatting
       role="msr"
     fi
   fi
+
   echo "$role"
 }
 
